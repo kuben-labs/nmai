@@ -1,4 +1,4 @@
-.PHONY: help dev install
+.PHONY: help dev dev-all dev-mcp dev-agent install clean clean-ai-accountant
 
 # Colors for output
 BLUE := \033[0;34m
@@ -6,38 +6,82 @@ GREEN := \033[0;32m
 YELLOW := \033[0;33m
 NC := \033[0m # No Color
 
-# Local development URLs (override production URLs in .env files)
-VIS_DOMAIN := http://localhost:3000
+# Local development URLs
+MCP_URL := http://localhost:8083/mcp
+AGENT_URL := http://localhost:8000
+SOLVE_ENDPOINT := $(AGENT_URL)/solve
 
 help: ## Show this help message
-	@echo "$(BLUE)MCP Development Commands$(NC)"
-	@echo "Local VIS domain: $(VIS_DOMAIN)"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "$(GREEN)%-20s$(NC) %s\n", $$1, $$2}'
+	@echo "$(BLUE)AI Accounting Agent - Development Commands$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Endpoints:$(NC)"
+	@echo "  MCP Server:     $(MCP_URL)"
+	@echo "  Agent Server:   $(AGENT_URL)"
+	@echo "  Solve Endpoint: $(SOLVE_ENDPOINT)"
+	@echo ""
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "$(GREEN)%-25s$(NC) %s\n", $$1, $$2}'
 
 # Development commands
-dev: ## Start all services in development mode (requires tmux or multiple terminals)
-	@echo "$(YELLOW)Starting all services...$(NC)"
-	@$(MAKE) -j1 dev-ai-accountant-mcp
+dev: dev-all ## Start all services (alias for dev-all)
 
-dev-ai-accountant-mcp: ## Start ai-accountant-mcp development server
-	@echo "$(BLUE)Starting ai-accountant-mcp...$(NC)"
+dev-all: ## Start MCP server and Agent server in background (requires tmux)
+	@echo "$(YELLOW)Starting all services...$(NC)"
+	@echo "$(BLUE)Starting MCP server on $(MCP_URL)$(NC)"
+	@tmux new-session -d -s accounting -n mcp -x 200 -y 50
+	@tmux send-keys -t accounting:mcp "cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py" Enter
+	@sleep 2
+	@echo "$(BLUE)Starting Agent server on $(AGENT_URL)$(NC)"
+	@tmux new-window -t accounting -n agent
+	@tmux send-keys -t accounting:agent "cd src && uvicorn ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8000 --reload" Enter
+	@echo ""
+	@echo "$(GREEN)✓ Services started in tmux session 'accounting'$(NC)"
+	@echo "$(BLUE)Attach with: tmux attach -t accounting$(NC)"
+	@echo "$(BLUE)Kill with: tmux kill-session -t accounting$(NC)"
+
+dev-mcp: ## Start MCP server only
+	@echo "$(BLUE)Starting MCP server on $(MCP_URL)...$(NC)"
 	@cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py
 
-install: ## Install all (uv)
-	@echo "$(BLUE)Installing dependencies...$(NC)"
-	@$(MAKE) -j1 install-ai-accountant
+dev-agent: ## Start Agent server only
+	@echo "$(BLUE)Starting Agent server on $(AGENT_URL)...$(NC)"
+	@cd src && uvicorn ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8000 --reload
 
-install-ai-accountant: ## Install ai-accountant dependencies (uv)
-	@echo "$(BLUE)Installing ai-accountant dependencies...$(NC)"
+dev-cli: ## Start CLI mode for testing agents locally
+	@echo "$(BLUE)Starting Agent CLI mode...$(NC)"
+	@uv run python -m ai_accounting_agent.main
+
+install: ## Install all dependencies
+	@echo "$(BLUE)Installing dependencies...$(NC)"
 	@uv sync
 
-clean: ## Clean all build artifacts and dependencies
-	@echo "$(BLUE)Cleaning all build artifacts and dependencies...$(NC)"
-	@$(MAKE) -j1 clean-ai-accountant
 
-clean-ai-accountant: ## Clean ai-accountant build artifacts and dependencies
-	@echo "$(BLUE)Cleaning ai-accountant...$(NC)"
-	@rm -rf .venv __pycache__
-	
+clean: ## Clean all build artifacts and caches
+	@echo "$(BLUE)Cleaning project...$(NC)"
+	@rm -rf .venv __pycache__ .pytest_cache .ruff_cache *.egg-info dist build
+	@rm -rf src/__pycache__ src/ai_accounting_agent/__pycache__
+	@rm -rf ai-accountant-mcp/__pycache__ ai-accountant-mcp/src/__pycache__
+	@rm -rf ai-accountant-mcp/.venv
+	@echo "$(GREEN)✓ Clean complete$(NC)"
+
+# Test commands
+test-health: ## Check if services are running
+	@echo "$(YELLOW)Testing service health...$(NC)"
+	@echo ""
+	@echo "$(BLUE)Checking MCP server...$(NC)"
+	@curl -s http://localhost:8083/health 2>/dev/null || echo "MCP server not responding"
+	@echo ""
+	@echo "$(BLUE)Checking Agent server...$(NC)"
+	@curl -s http://localhost:8000/health 2>/dev/null || echo "Agent server not responding"
+
+# Logging helpers
+logs-mcp: ## View MCP server logs (tmux)
+	@tmux capture-pane -t accounting:mcp -p
+
+logs-agent: ## View Agent server logs (tmux)
+	@tmux capture-pane -t accounting:agent -p
+
+logs-all: ## View all logs (tmux)
+	@tmux capture-pane -t accounting -p -S -100
+
 # Default target
 .DEFAULT_GOAL := help
