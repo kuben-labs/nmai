@@ -1,89 +1,144 @@
-"""AI Accountant MCP Server using Tripletex API v2
+"""
+FastMCP Server for Tripletex API v2
 
-This server provides tools to interact with Tripletex API v2 including:
-- Creating invoices
-- Searching invoices
+This server automatically generates MCP tools from the Tripletex OpenAPI specification.
+All 800+ API endpoints are exposed as MCP tools that LLMs can call.
+
+Authentication: Uses session-based authentication (Basic Auth with username=0)
+- Session token provided per-request in Authorization header
+- No env vars needed - token passed dynamically by coordinator
+
+Usage:
+    python server.py
+
+    Starts MCP server on http://0.0.0.0:8083/mcp
 """
 
-import os
+import json
+import base64
+import httpx
 from fastmcp import FastMCP
-from dotenv import load_dotenv
-load_dotenv()
+from loguru import logger
 
-# Initialize FastMCP server
-mcp = FastMCP(
-    name="ai-accountant-mcp",
-    version="0.1.0"
-)
+# ============================================================================
+# Configuration
+# ============================================================================
 
-class TripletexAPI:
-    """Simple Tripletex API client for demonstration purposes"""
-    def __init__(self, client_id, client_secret, access_token, access_secret):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.access_token = access_token
-        self.access_secret = access_secret
+TRIPLETEX_BASE_URL = "https://kkpqfuj-amager.tripletex.dev/v2"
+TRIPLETEX_OPENAPI_URL = "https://kkpqfuj-amager.tripletex.dev/v2/openapi.json"
 
-    def create_invoice(self, invoice_data):
-        """Create a new invoice in Tripletex (placeholder implementation)"""
-        # Here you would implement the actual API call to Tripletex
-        # For demonstration, we return a mock response
-        return {"id": "mock-invoice-id", "status": "created"}
-    
-# Initialize Tripletex API client with OAuth 2.0
-def get_tripletex_client():
-    """Initialize and return Tripletex API client with OAuth 2.0 credentials"""
-    client_id = os.getenv("CLIENT_ID")
-    client_secret = os.getenv("CLIENT_SECRET")
-    access_token = os.getenv("ACCESS_TOKEN")
-    access_secret = os.getenv("ACCESS_TOKEN_SECRET")
-    # Debug logging (remove in production)
-    print(f"DEBUG - CLIENT_ID present: {bool(client_id)}")
-    print(f"DEBUG - CLIENT_SECRET present: {bool(client_secret)}")
-    print(f"DEBUG - ACCESS_TOKEN present: {bool(access_token)}")
-    print(f"DEBUG - ACCESS_TOKEN_SECRET present: {bool(access_secret)}")
-    
-    if not all([client_id, client_secret, access_token, access_secret]):
-        raise ValueError(
-            "Missing required environment variables. Please set: "
-            "CLIENT_ID, CLIENT_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET"
-        )
-    
-    return TripletexAPI(client_id, client_secret, access_token, access_secret)
+# ============================================================================
+# Initialize MCP from OpenAPI Spec
+# ============================================================================
 
 
-@mcp.tool()
-def post_invoice(invoice_data: dict) -> str:
-    """Create a new invoice in Tripletex
+def create_mcp_server():
+    """
+    Create and configure the MCP server from Tripletex OpenAPI spec.
 
-    Args:
-        invoice_data: A dictionary containing the invoice details
+    This function:
+    1. Fetches the OpenAPI spec from Tripletex
+    2. Creates an HTTP client (unauthenticated initially)
+    3. Generates MCP tools from all OpenAPI endpoints
+    4. Returns the configured MCP server
 
     Returns:
-        Success message with invoice ID or error message
+        FastMCP server with all Tripletex tools configured
     """
+    logger.info("Initializing Tripletex MCP Server...")
+
+    # Step 1: Fetch OpenAPI spec
+    logger.info(f"Fetching OpenAPI spec from {TRIPLETEX_OPENAPI_URL}")
     try:
-        api = get_tripletex_client()
-        
-        # Validate invoice data
-        if not invoice_data:
-            return "Error: Invoice data is required"
+        response = httpx.get(TRIPLETEX_OPENAPI_URL, timeout=30.0)
+        response.raise_for_status()
+        openapi_spec = response.json()
+        logger.info(f"✓ OpenAPI spec loaded successfully")
+    except httpx.RequestError as e:
+        logger.error(f"Failed to fetch OpenAPI spec: {e}")
+        raise
 
-        
-        # Create invoice
-        response = api.create_invoice(invoice_data)
-        invoice_id = response.get('id')
-        if invoice_id:
-            return f"Invoice created successfully with ID: {invoice_id}"
-        else:
-            return "Failed to create invoice. No ID returned."
+    # Step 2: Create HTTP client
+    # Note: Authentication is handled dynamically by the coordinator
+    # Each request will include the session token in the Authorization header
+    client = httpx.AsyncClient(
+        base_url=TRIPLETEX_BASE_URL,
+        timeout=30.0,
+    )
 
-    except ValueError as e:
-        return f"Configuration error: {str(e)}"
-    except Exception as e:
-        return f"Unexpected error: {str(e)}"
+    logger.info(f"Base URL: {TRIPLETEX_BASE_URL}")
 
+    # Step 3: Create MCP from OpenAPI spec
+    # This automatically converts ~800 API endpoints into MCP tools
+    logger.info("Generating MCP tools from OpenAPI spec...")
+    mcp = FastMCP.from_openapi(
+        openapi_spec=openapi_spec,
+        client=client,
+        name="tripletex-mcp",
+        tags={"tripletex", "accounting", "api-v2"},
+    )
+
+    endpoint_count = len(openapi_spec.get("paths", {}))
+    logger.info(f"✓ MCP server created with {endpoint_count} endpoints")
+
+    return mcp
+
+
+# ============================================================================
+# Create and Configure Server
+# ============================================================================
+
+try:
+    mcp = create_mcp_server()
+except Exception as e:
+    logger.error(f"Failed to initialize MCP server: {e}")
+    # Create a minimal server that reports the error
+    mcp = FastMCP(name="tripletex-mcp", version="0.1.0")
+
+    @mcp.tool()
+    def initialization_error() -> str:
+        """
+        MCP server initialization failed.
+
+        Check the logs above for details.
+        Common issues:
+        - Network connectivity to Tripletex API
+        - Invalid OpenAPI spec format
+        - Timeout fetching spec
+        """
+        return f"Initialization error: {str(e)}"
+
+
+# ============================================================================
+# Authentication Helper (Reference)
+# ============================================================================
+
+
+def encode_session_token(session_token: str) -> str:
+    """
+    Encode session token in Tripletex Basic Auth format.
+
+    Tripletex uses: Authorization: Basic base64(0:SESSION_TOKEN)
+    Username is always "0", password is the session token.
+
+    Args:
+        session_token: The session token from Tripletex
+
+    Returns:
+        Base64-encoded Basic Auth credentials
+    """
+    credentials = f"0:{session_token}"
+    encoded = base64.b64encode(credentials.encode()).decode()
+    return f"Basic {encoded}"
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
 if __name__ == "__main__":
-    # Run as HTTP server for MCP
+    logger.info("Starting Tripletex MCP Server on http://0.0.0.0:8083")
+    logger.info("Press Ctrl+C to stop")
+
+    # Run MCP server on port 8083
     mcp.run(transport="http", host="0.0.0.0", port=8083)
