@@ -1,0 +1,9 @@
+{
+	"servers": {
+		"ai-accountant": {
+			"type": "http",
+			"url": "http://localhost:8004/mcp"
+		}
+	},
+	"inputs": []
+}
