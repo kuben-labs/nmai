@@ -47,7 +47,7 @@ dev-mcp: ## Start MCP server only
 
 dev-agent: ## Start Agent server only
 	@echo "$(BLUE)Starting Agent server on $(AGENT_URL)...$(NC)"
-	@cd src && uvicorn ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8000 --reload
+	@cd src && uv run uvicorn ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8000 --reload
 
 dev-cli: ## Start CLI mode for testing agents locally
 	@echo "$(BLUE)Starting Agent CLI mode...$(NC)"
