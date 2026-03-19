@@ -197,13 +197,32 @@ async def debug_plan(request: Request):
     Debug endpoint to test just the planning phase.
 
     Useful for debugging task analysis without full execution.
+
+    Request body:
+    {
+        "prompt": "Task description"
+    }
     """
     try:
+        # Get request body safely
         body = await request.json()
-        prompt = body.get("prompt")
+        if not body:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Empty request body"},
+            )
 
+        prompt = body.get("prompt")
         if not prompt:
-            return JSONResponse(status_code=400, content={"error": "Missing prompt"})
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Missing 'prompt' field in request body",
+                },
+            )
+
+        logger.info(f"Debug plan request: {prompt[:100]}...")
 
         from .planner import AccountingPlanner
 
@@ -214,8 +233,17 @@ async def debug_plan(request: Request):
             status_code=200, content={"status": "success", "plan": plan}
         )
 
+    except ValueError as e:
+        logger.error(f"Debug plan JSON error: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": f"Invalid JSON: {str(e)}. Expected: {{'prompt': 'task description'}}",
+            },
+        )
     except Exception as e:
-        logger.error(f"Debug plan error: {e}")
+        logger.error(f"Debug plan error: {e}", exc_info=True)
         return JSONResponse(
             status_code=500, content={"status": "error", "message": str(e)}
         )
@@ -225,15 +253,32 @@ async def debug_plan(request: Request):
 async def debug_split(request: Request):
     """
     Debug endpoint to test the task splitting phase.
+
+    Request body:
+    {
+        "planning_context": "The plan output from /debug/plan"
+    }
     """
     try:
+        # Get request body safely
         body = await request.json()
-        planning_context = body.get("planning_context")
+        if not body:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Empty request body"},
+            )
 
+        planning_context = body.get("planning_context")
         if not planning_context:
             return JSONResponse(
-                status_code=400, content={"error": "Missing planning_context"}
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Missing 'planning_context' field in request body",
+                },
             )
+
+        logger.info(f"Debug split request: {planning_context[:100]}...")
 
         from .task_splitter import TaskSplitter
 
@@ -244,8 +289,17 @@ async def debug_split(request: Request):
             status_code=200, content={"status": "success", "subtasks": subtasks}
         )
 
+    except ValueError as e:
+        logger.error(f"Debug split JSON error: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": f"Invalid JSON: {str(e)}. Expected: {{'planning_context': 'plan text'}}",
+            },
+        )
     except Exception as e:
-        logger.error(f"Debug split error: {e}")
+        logger.error(f"Debug split error: {e}", exc_info=True)
         return JSONResponse(
             status_code=500, content={"status": "error", "message": str(e)}
         )
