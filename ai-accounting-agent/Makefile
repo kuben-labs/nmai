@@ -24,19 +24,15 @@ help: ## Show this help message
 # Development commands
 dev: dev-all ## Start all services (alias for dev-all)
 
-dev-all: ## Start MCP server and Agent server in background (requires tmux)
+dev-all: ## Start MCP server and Agent server in background 
 	@echo "$(YELLOW)Starting all services...$(NC)"
 	@echo "$(BLUE)Starting MCP server on $(MCP_URL)$(NC)"
-	@tmux new-session -d -s accounting -n mcp -x 200 -y 50
-	@tmux send-keys -t accounting:mcp "cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py" Enter
+	@cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py" Enter
 	@sleep 2
 	@echo "$(BLUE)Starting Agent server on $(AGENT_URL)$(NC)"
-	@tmux new-window -t accounting -n agent
-	@tmux send-keys -t accounting:agent "cd src && uvicorn ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8000 --reload" Enter
+	@cd src && uvicorn ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8000 --reload" Enter
 	@echo ""
-	@echo "$(GREEN)✓ Services started in tmux session 'accounting'$(NC)"
-	@echo "$(BLUE)Attach with: tmux attach -t accounting$(NC)"
-	@echo "$(BLUE)Kill with: tmux kill-session -t accounting$(NC)"
+	@echo "$(GREEN)✓ All services started$(NC)"
 
 dev-mcp: ## Start MCP server only
 	@echo "$(BLUE)Starting MCP server on $(MCP_URL)...$(NC)"
@@ -72,16 +68,5 @@ test-health: ## Check if services are running
 	@echo ""
 	@echo "$(BLUE)Checking Agent server...$(NC)"
 	@curl -s http://localhost:8000/health 2>/dev/null || echo "Agent server not responding"
-
-# Logging helpers
-logs-mcp: ## View MCP server logs (tmux)
-	@tmux capture-pane -t accounting:mcp -p
-
-logs-agent: ## View Agent server logs (tmux)
-	@tmux capture-pane -t accounting:agent -p
-
-logs-all: ## View all logs (tmux)
-	@tmux capture-pane -t accounting -p -S -100
-
 # Default target
 .DEFAULT_GOAL := help
