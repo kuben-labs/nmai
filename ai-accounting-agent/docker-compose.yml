@@ -1,0 +1,9 @@
+services:
+  ai-accountant-agent:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    expose:
+      - 8084
+    restart: unless-stopped
+    container_name: ai-accountant-agent
