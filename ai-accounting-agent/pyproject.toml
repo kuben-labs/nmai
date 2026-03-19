@@ -1,7 +1,23 @@
 [project]
 name = "ai-accounting-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Build an AI agent that completes accounting tasks in Tripletex. You receive a task prompt (in one of 7 languages), use the Tripletex API to execute it, and get scored on correctness and efficiency."
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+authors = [
+    { name = "valiantlynx", email = "gormerykombo@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "loguru>=0.7.3",
+    "machine-core",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.uv.sources]
+machine-core = { git = "git+https://github.com/samletnorge/machine-core.git" }
+
+[build-system]
+requires = ["uv_build>=0.8.17,<0.9.0"]
+build-backend = "uv_build"
