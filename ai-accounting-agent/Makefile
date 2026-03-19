@@ -24,15 +24,22 @@ help: ## Show this help message
 # Development commands
 dev: dev-all ## Start all services (alias for dev-all)
 
-dev-all: ## Start MCP server and Agent server in background 
+dev: ## Start all services in development mode
 	@echo "$(YELLOW)Starting all services...$(NC)"
-	@echo "$(BLUE)Starting MCP server on $(MCP_URL)$(NC)"
-	@cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py" Enter
-	@sleep 2
-	@echo "$(BLUE)Starting Agent server on $(AGENT_URL)$(NC)"
-	@cd src && uvicorn ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8000 --reload" Enter
-	@echo ""
-	@echo "$(GREEN)✓ All services started$(NC)"
+	@$(MAKE) -j3 kill-ports dev-mcp dev-agent
+
+
+kill-ports: ## Free development ports (8000, 8083)
+	@echo "$(YELLOW)Freeing development ports (8000, 8083)...$(NC)"
+	@for port in 8000 8083; do \
+		pids=$$(lsof -ti tcp:$$port 2>/dev/null); \
+		if [ -n "$$pids" ]; then \
+			echo "Stopping processes $$pids on port $$port"; \
+			echo "$$pids" | xargs kill; \
+		else \
+			echo "No process found on port $$port"; \
+		fi; \
+	done
 
 dev-mcp: ## Start MCP server only
 	@echo "$(BLUE)Starting MCP server on $(MCP_URL)...$(NC)"
