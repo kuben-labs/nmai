@@ -11,6 +11,19 @@ MCP_URL := http://localhost:8083/mcp
 AGENT_URL := http://localhost:8000
 SOLVE_ENDPOINT := $(AGENT_URL)/solve
 
+# Load environment variables from ai-accountant-mcp/.env if it exists
+ifneq (,$(wildcard ai-accountant-mcp/.env))
+    include ai-accountant-mcp/.env
+    export
+endif
+
+# Load environment variables from .env if it exists
+ifneq (,$(wildcard .env))
+    include .env
+    export
+endif
+
+
 help: ## Show this help message
 	@echo "$(BLUE)AI Accounting Agent - Development Commands$(NC)"
 	@echo ""
