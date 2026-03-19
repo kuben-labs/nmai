@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.valiantlynx/altlokalt-researcher",
+  "title": "altlokalt-researcher",
+  "description": "Norwegian Business Researcher MCP server using Altlokalt.com, Brøynnesund API and internet search.",
+  "repository": {
+    "url": "https://github.com/samletnorge/altlokalt-researcher",
+    "source": "github"
+  },
+  "version": "1.0.3",
+  "packages": [],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://altlokalt-researcher.altlokalt.com/mcp"
+    }
+  ]
+}
