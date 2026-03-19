@@ -1,0 +1,18 @@
+services:
+  ai-accountant-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    expose:
+      - 8083
+    restart: unless-stopped
+    container_name: ai-accountant-mcp
+    environment:
+      - API_KEY=${API_KEY}
+      - API_SECRET_KEY=${API_SECRET_KEY}
+      - ACCESS_TOKEN=${ACCESS_TOKEN}
+      - ACCESS_TOKEN_SECRET=${ACCESS_TOKEN_SECRET}
+
+networks:
+  dokploy-network:
+    external: true

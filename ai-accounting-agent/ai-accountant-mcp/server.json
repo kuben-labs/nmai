@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.valiantlynx/ai-accountant-mcp",
+  "title": "ai-accountant-mcp",
+  "description": "An MCP server that uses the Tripletex API v2",
+  "repository": {
+    "url": "https://github.com/mythrantic/ai-accountant-mcp",
+    "source": "github"
+  },
+  "version": "0.0.3",
+  "packages": [],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://ai-accountant-mcp.valiantlynx.com/mcp"
+    }
+  ]
+}
