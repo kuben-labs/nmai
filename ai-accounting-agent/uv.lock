@@ -1321,8 +1321,8 @@ wheels = [
 
 [[package]]
 name = "machine-core"
-version = "0.1.5"
-source = { git = "https://github.com/samletnorge/machine-core.git#7fb5ac966ab8295f004cb8515c15e051b254080a" }
+version = "0.1.6"
+source = { git = "https://github.com/samletnorge/machine-core.git#c80e0f68b5155c4ac135ce1e48fa58f427bdd15a" }
 dependencies = [
     { name = "asyncio" },
     { name = "fastapi" },
@@ -1400,8 +1400,8 @@ wheels = [
 
 [[package]]
 name = "model-providers"
-version = "0.0.3"
-source = { git = "https://github.com/samletnorge/model-providers.git#32e244bb5e834ada953c6c3223fc3aa70131ed14" }
+version = "0.0.5"
+source = { git = "https://github.com/samletnorge/model-providers.git#82d0ee4b3a87e3f5c13c69c9fe0a7135ef8f2d0a" }
 dependencies = [
     { name = "azure-identity" },
     { name = "azure-keyvault" },
