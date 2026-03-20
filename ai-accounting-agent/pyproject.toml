@@ -14,6 +14,7 @@ dependencies = [
     "uvicorn>=0.32.0",
     "python-dotenv>=1.0.0",
     "ai-accountant-mcp",
+    "lancedb>=0.30.1",
 ]
 
 [tool.uv.sources]
