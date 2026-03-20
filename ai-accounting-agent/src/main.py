@@ -1,17 +1,37 @@
 """Chat agent for interactive conversations."""
 
+import os
+import sys
+
+# Configure environment BEFORE any imports
+os.environ["LOGURU_LEVEL"] = "ERROR"
+
 from pathlib import Path
 from typing import Optional, Union
 from machine_core.core.agent_base import BaseAgent
 from machine_core.core.config import AgentConfig
 import asyncio
 import logging
-import os
 
-# Suppress debug logs for cleaner UI
-logging.getLogger("loguru").setLevel(logging.WARNING)
-logging.getLogger("machine_core").setLevel(logging.WARNING)
-os.environ["LOGURU_LEVEL"] = "WARNING"
+# Suppress all debug/info logs
+logging.getLogger().setLevel(logging.ERROR)
+for logger_name in [
+    "loguru",
+    "machine_core",
+    "pydantic_ai",
+    "model_providers",
+    "google",
+    "httpx",
+]:
+    logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+# Try to remove loguru handlers to suppress their output
+try:
+    from loguru import logger
+
+    logger.remove()
+except:
+    pass
 
 agent_config = AgentConfig(
     max_iterations=3, timeout=60000, max_tool_retries=3, allow_sampling=True
