@@ -593,11 +593,11 @@ class RAGToolFilter(AbstractToolset):
 
             # Delegate to wrapped toolset with correct signature
             result = await self.wrapped_toolset.call_tool(name, tool_args, ctx, tool)
+            return result
 
-            # Handle empty responses - return empty string or object as appropriate
-            if result is None:
-                # Return appropriate empty value based on tool return type
-                return "" if tool.return_type == str else {}
+        except ValueError:
+            # Re-raise ValueError as-is (tool not in relevant set)
+            raise
 
             return result
 
