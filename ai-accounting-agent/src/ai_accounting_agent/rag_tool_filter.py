@@ -591,7 +591,7 @@ class RAGToolFilter(AbstractToolset):
                 logger.warning(error_msg)
                 raise ValueError(error_msg)
 
-            # Delegate to wrapped toolset
+            # Delegate to wrapped toolset with correct signature
             return await self.wrapped_toolset.call_tool(name, tool_args, ctx, tool)
 
         except Exception as e:
