@@ -35,6 +35,8 @@ class AccountingSubAgent(BaseAgent):
             main_task: The overall accounting task
             tripletex_credentials: Tripletex API credentials (base_url, session_token)
         """
+        # Extract credentials for inclusion in prompt
+        # NOTE: These are for transparency; actual API calls use MCP server's .env credentials
         base_url = (tripletex_credentials or {}).get(
             "base_url", "https://api.tripletex.no/v2"
         )
@@ -237,6 +239,10 @@ class CoordinatorAgent(BaseAgent):
                 await self._initialize_rag_filtering()
 
             # Create the prompt for execution with credentials
+            # NOTE: These credentials are informational - the actual API calls use
+            # credentials from the MCP server's .env file, not these values.
+            # The LLM cannot use these credentials directly; they're provided for
+            # transparency and future extensibility.
             base_url = self.tripletex_credentials.get(
                 "base_url", "https://api.tripletex.no/v2"
             )
