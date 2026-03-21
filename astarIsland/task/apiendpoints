@@ -1,0 +1,722 @@
+API Endpoint Specification
+Base URL
+https://api.ainm.no/astar-island
+
+All endpoints require authentication. The API accepts either:
+
+Cookie: access_token JWT cookie (set automatically when you log in at app.ainm.no)
+Bearer token: Authorization: Bearer <token> header
+
+Both methods use the same JWT token. Use whichever is more convenient for your setup.
+Endpoints Overview
+
+
+
+Method
+Path
+Auth
+Description
+
+
+
+
+GET
+/astar-island/rounds
+Public
+List all rounds
+
+
+GET
+/astar-island/rounds/{round_id}
+Public
+Round details + initial states
+
+
+GET
+/astar-island/budget
+Team
+Query budget for active round
+
+
+POST
+/astar-island/simulate
+Team
+Observe one simulation through viewport
+
+
+POST
+/astar-island/submit
+Team
+Submit prediction tensor
+
+
+GET
+/astar-island/my-rounds
+Team
+Rounds with your scores, rank, budget
+
+
+GET
+/astar-island/my-predictions/{round_id}
+Team
+Your predictions with argmax/confidence
+
+
+GET
+/astar-island/analysis/{round_id}/{seed_index}
+Team
+Post-round ground truth comparison
+
+
+GET
+/astar-island/leaderboard
+Public
+Astar Island leaderboard
+
+
+
+GET /astar-island/rounds
+List all rounds with status and timing.
+[
+  {
+    "id": "uuid",
+    "round_number": 1,
+    "event_date": "2026-03-19",
+    "status": "active",
+    "map_width": 40,
+    "map_height": 40,
+    "prediction_window_minutes": 165,
+    "started_at": "2026-03-19T10:00:00Z",
+    "closes_at": "2026-03-19T12:45:00Z",
+    "round_weight": 1,
+    "created_at": "2026-03-19T09:00:00Z"
+  }
+]
+Round Status
+
+
+
+Status
+Meaning
+
+
+
+
+pending
+Round created but not yet started
+
+
+active
+Queries and submissions open
+
+
+scoring
+Submissions closed, scoring in progress
+
+
+completed
+Scores finalized
+
+
+
+GET /astar-island/rounds/{round_id}
+Returns round details including initial map states for all seeds. Use this to reconstruct the starting terrain locally.
+Note: Settlement data in initial states shows only position and port status. Internal stats (population, food, wealth, defense) are not exposed.
+{
+  "id": "uuid",
+  "round_number": 1,
+  "status": "active",
+  "map_width": 40,
+  "map_height": 40,
+  "seeds_count": 5,
+  "initial_states": [
+    {
+      "grid": [[10, 10, 10, ...], ...],
+      "settlements": [
+        {
+          "x": 5, "y": 12,
+          "has_port": true,
+          "alive": true
+        }
+      ]
+    }
+  ]
+}
+Grid Cell Values
+
+
+
+Value
+Terrain
+
+
+
+
+0
+Empty
+
+
+1
+Settlement
+
+
+2
+Port
+
+
+3
+Ruin
+
+
+4
+Forest
+
+
+5
+Mountain
+
+
+10
+Ocean
+
+
+11
+Plains
+
+
+
+GET /astar-island/budget
+Check your team's remaining query budget for the active round.
+{
+  "round_id": "uuid",
+  "queries_used": 23,
+  "queries_max": 50,
+  "active": true
+}
+Rate Limits
+
+
+
+Endpoint
+Limit
+
+
+
+
+POST /simulate
+5 requests/second per team
+
+
+POST /submit
+2 requests/second per team
+
+
+
+Exceeding these limits returns 429 Too Many Requests.
+POST /astar-island/simulate
+This is the core observation endpoint. Each call runs one stochastic simulation and reveals a viewport window of the result. Costs one query from your budget (50 per round).
+
+Request
+{
+  "round_id": "uuid-of-active-round",
+  "seed_index": 3,
+  "viewport_x": 10,
+  "viewport_y": 5,
+  "viewport_w": 15,
+  "viewport_h": 15
+}
+
+
+
+Field
+Type
+Description
+
+
+
+
+round_id
+string
+UUID of the active round
+
+
+seed_index
+int (0–4)
+Which of the 5 seeds to simulate
+
+
+viewport_x
+int (>=0)
+Left edge of viewport (default 0)
+
+
+viewport_y
+int (>=0)
+Top edge of viewport (default 0)
+
+
+viewport_w
+int (5–15)
+Viewport width (default 15)
+
+
+viewport_h
+int (5–15)
+Viewport height (default 15)
+
+
+
+Response
+{
+  "grid": [[4, 11, 1, ...], ...],
+  "settlements": [
+    {
+      "x": 12, "y": 7,
+      "population": 2.8,
+      "food": 0.4,
+      "wealth": 0.7,
+      "defense": 0.6,
+      "has_port": true,
+      "alive": true,
+      "owner_id": 3
+    }
+  ],
+  "viewport": {"x": 10, "y": 5, "w": 15, "h": 15},
+  "width": 40,
+  "height": 40,
+  "queries_used": 24,
+  "queries_max": 50
+}
+The grid contains only the viewport region (viewport_h × viewport_w), not the full map. The settlements list includes only settlements within the viewport. The viewport object confirms the actual viewport bounds (clamped to map edges). width and height give the full map dimensions.
+Each call uses a different random sim_seed, so you get a different stochastic outcome.
+Error Codes
+
+
+
+Status
+Meaning
+
+
+
+
+400
+Round not active, or invalid seed_index
+
+
+403
+Not on a team
+
+
+404
+Round not found
+
+
+429
+Query budget exhausted (50/50) or rate limit exceeded (max 5 req/sec)
+
+
+
+POST /astar-island/submit
+Submit your prediction for one seed. You must submit all 5 seeds for a complete score.
+Request
+{
+  "round_id": "uuid-of-active-round",
+  "seed_index": 3,
+  "prediction": [
+    [
+      [0.85, 0.05, 0.02, 0.03, 0.03, 0.02],
+      [0.10, 0.40, 0.30, 0.10, 0.05, 0.05],
+      ...
+    ],
+    ...
+  ]
+}
+
+
+
+Field
+Type
+Description
+
+
+
+
+round_id
+string
+UUID of the active round
+
+
+seed_index
+int (0–4)
+Which seed this prediction is for
+
+
+prediction
+float[][][]
+H×W×6 tensor — probability per cell per class
+
+
+
+Prediction Format
+The prediction is a 3D array: prediction[y][x][class]
+
+Outer dimension: H rows (height)
+Middle dimension: W columns (width)
+Inner dimension: 6 probabilities (one per class)
+Each cell's 6 probabilities must sum to 1.0 (±0.01 tolerance)
+All probabilities must be non-negative
+
+Class Indices
+
+
+
+Index
+Class
+
+
+
+
+0
+Empty (Ocean, Plains, Empty)
+
+
+1
+Settlement
+
+
+2
+Port
+
+
+3
+Ruin
+
+
+4
+Forest
+
+
+5
+Mountain
+
+
+
+Response
+{
+  "status": "accepted",
+  "round_id": "uuid",
+  "seed_index": 3
+}
+Resubmitting for the same seed overwrites your previous prediction. Only the last submission counts.
+Validation Errors
+
+
+
+Error
+Cause
+
+
+
+
+Expected H rows, got N
+Wrong number of rows
+
+
+Row Y: expected W cols, got N
+Wrong number of columns
+
+
+Cell (Y,X): expected 6 probs, got N
+Wrong probability vector length
+
+
+Cell (Y,X): probs sum to S, expected 1.0
+Probabilities don't sum to 1.0
+
+
+Cell (Y,X): negative probability
+Negative value in probability vector
+
+
+
+GET /astar-island/my-rounds
+Returns all rounds enriched with your team's scores, submission counts, rank, and query budget. This is the team-specific version of /rounds.
+Auth required.
+[
+  {
+    "id": "uuid",
+    "round_number": 1,
+    "event_date": "2026-03-19",
+    "status": "completed",
+    "map_width": 40,
+    "map_height": 40,
+    "seeds_count": 5,
+    "round_weight": 1,
+    "started_at": "2026-03-19T10:00:00+00:00",
+    "closes_at": "2026-03-19T10:45:00+00:00",
+    "prediction_window_minutes": 165,
+    "round_score": 72.5,
+    "seed_scores": [80.1, 65.3, 71.9, ...],
+    "seeds_submitted": 5,
+    "rank": 3,
+    "total_teams": 12,
+    "queries_used": 48,
+    "queries_max": 50,
+    "initial_grid": [[10, 10, 10, ...], ...]
+  }
+]
+
+
+
+Field
+Type
+Description
+
+
+
+
+round_score
+float | null
+Your team's average score across all seeds (null if not scored)
+
+
+seed_scores
+float[] | null
+Per-seed scores (null if not scored)
+
+
+seeds_submitted
+int
+Number of seeds your team has submitted predictions for
+
+
+rank
+int | null
+Your team's rank for this round (null if not scored)
+
+
+total_teams
+int | null
+Total teams scored in this round
+
+
+queries_used
+int
+Simulation queries used by your team
+
+
+queries_max
+int
+Maximum queries allowed (default 50)
+
+
+initial_grid
+int[][]
+Initial terrain grid for the first seed
+
+
+
+Error Codes
+
+
+
+Status
+Meaning
+
+
+
+
+403
+Not on a team
+
+
+
+GET /astar-island/my-predictions/{round_id}
+Returns your team's submitted predictions for a given round, with derived argmax and confidence grids for easy visualization.
+Auth required.
+[
+  {
+    "seed_index": 0,
+    "argmax_grid": [[0, 4, 5, ...], ...],
+    "confidence_grid": [[0.85, 0.72, 0.93, ...], ...],
+    "score": 78.2,
+    "submitted_at": "2026-03-19T10:30:00+00:00"
+  }
+]
+
+
+
+Field
+Type
+Description
+
+
+
+
+seed_index
+int
+Which seed this prediction is for (0–4)
+
+
+argmax_grid
+int[][]
+H×W grid of predicted class indices (argmax of probability vector)
+
+
+confidence_grid
+float[][]
+H×W grid of confidence values (max probability per cell, rounded to 3 decimals)
+
+
+score
+float | null
+Score for this seed (null if not yet scored)
+
+
+submitted_at
+string | null
+ISO 8601 timestamp of submission
+
+
+
+The argmax_grid uses the same class indices as the prediction format (0=Empty, 1=Settlement, 2=Port, 3=Ruin, 4=Forest, 5=Mountain).
+Error Codes
+
+
+
+Status
+Meaning
+
+
+
+
+403
+Not on a team
+
+
+
+GET /astar-island/analysis/{round_id}/{seed_index}
+Post-round analysis endpoint. Returns your prediction alongside the ground truth for a specific seed, enabling detailed comparison. Only available after a round is completed (or during scoring).
+Auth required.
+{
+  "prediction": [[[0.85, 0.05, 0.02, 0.03, 0.03, 0.02], ...], ...],
+  "ground_truth": [[[0.90, 0.03, 0.01, 0.02, 0.02, 0.02], ...], ...],
+  "score": 78.2,
+  "width": 40,
+  "height": 40,
+  "initial_grid": [[10, 10, 10, ...], ...]
+}
+
+
+
+Field
+Type
+Description
+
+
+
+
+prediction
+float[][][]
+Your submitted H×W×6 probability tensor
+
+
+ground_truth
+float[][][]
+The actual H×W×6 probability distribution (computed from Monte Carlo simulations)
+
+
+score
+float | null
+Your score for this seed
+
+
+width
+int
+Map width
+
+
+height
+int
+Map height
+
+
+initial_grid
+int[][] | null
+Initial terrain grid for this seed
+
+
+
+Error Codes
+
+
+
+Status
+Meaning
+
+
+
+
+400
+Round not completed/scoring yet, or invalid seed_index
+
+
+403
+Not on a team
+
+
+404
+Round not found
+
+
+
+GET /astar-island/leaderboard
+Public leaderboard. Each team's score is their best round score of all time (weighted by round weight).
+[
+  {
+    "team_id": "uuid",
+    "team_name": "Vikings ML",
+    "team_slug": "vikings-ml",
+    "weighted_score": 72.5,
+    "rounds_participated": 3,
+    "hot_streak_score": 78.1,
+    "rank": 1,
+    "is_verified": true
+  }
+]
+
+
+
+Field
+Type
+Description
+
+
+
+
+weighted_score
+float
+Best round_score × round_weight across all rounds
+
+
+rounds_participated
+int
+Total rounds this team has submitted predictions
+
+
+hot_streak_score
+float
+Average score of last 3 rounds
+
+
+is_verified
+bool
+Whether all team members are Vipps-verified
+
+
+rank
+int
+Current leaderboard rank
+
+
+

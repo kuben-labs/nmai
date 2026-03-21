@@ -1,0 +1,72 @@
+Astar Island Quickstart
+Authentication
+All endpoints require authentication. Log in at app.ainm.no, then inspect cookies in your browser to grab your access_token JWT.
+You can authenticate using either a cookie or a Bearer token header:
+import requests
+ 
+BASE = "https://api.ainm.no"
+ 
+# Option 1: Cookie-based auth
+session = requests.Session()
+session.cookies.set("access_token", "YOUR_JWT_TOKEN")
+ 
+# Option 2: Bearer token auth
+session = requests.Session()
+session.headers["Authorization"] = "Bearer YOUR_JWT_TOKEN"
+Step 1: Get the Active Round
+rounds = session.get(f"{BASE}/astar-island/rounds").json()
+active = next((r for r in rounds if r["status"] == "active"), None)
+ 
+if active:
+    round_id = active["id"]
+    print(f"Active round: {active['round_number']}")
+Step 2: Get Round Details
+Fetch the detail endpoint to get full round info including seeds_count and initial states:
+detail = session.get(f"{BASE}/astar-island/rounds/{round_id}").json()
+ 
+width = detail["map_width"]      # 40
+height = detail["map_height"]    # 40
+seeds = detail["seeds_count"]    # 5
+print(f"Round: {width}x{height}, {seeds} seeds")
+ 
+for i, state in enumerate(detail["initial_states"]):
+    grid = state["grid"]           # height x width terrain codes
+    settlements = state["settlements"]  # [{x, y, has_port, alive}, ...]
+    print(f"Seed {i}: {len(settlements)} settlements")
+Step 3: Query the Simulator
+You have 50 queries per round, shared across all seeds. Each query reveals a 5-15 cell wide viewport:
+result = session.post(f"{BASE}/astar-island/simulate", json={
+    "round_id": round_id,
+    "seed_index": 0,
+    "viewport_x": 10,
+    "viewport_y": 5,
+    "viewport_w": 15,
+    "viewport_h": 15,
+}).json()
+ 
+grid = result["grid"]                # 15x15 terrain after simulation
+settlements = result["settlements"]  # settlements in viewport with full stats
+viewport = result["viewport"]        # {x, y, w, h}
+Step 4: Build and Submit Predictions
+For each seed, submit a height x width x 6 probability tensor. Each cell has 6 values representing the probability of each terrain class (Empty, Settlement, Port, Ruin, Forest, Mountain). They must sum to 1.0:
+import numpy as np
+ 
+for seed_idx in range(seeds):
+    prediction = np.full((height, width, 6), 1/6)  # uniform baseline
+ 
+    # TODO: replace with your model's predictions
+    # prediction[y][x] = [p_empty, p_settlement, p_port, p_ruin, p_forest, p_mountain]
+ 
+    resp = session.post(f"{BASE}/astar-island/submit", json={
+        "round_id": round_id,
+        "seed_index": seed_idx,
+        "prediction": prediction.tolist(),
+    })
+    print(f"Seed {seed_idx}: {resp.status_code}")
+A uniform prediction scores ~1-5. Use your queries to build better predictions.
+
+Warning: Never assign probability 0.0 to any class. If the ground truth has any non-zero probability for a class you marked as zero, KL divergence becomes infinite and your score for that cell is destroyed. Always enforce a minimum floor (e.g., 0.01) and renormalize. See the scoring docs for details.
+
+Using the MCP Server
+Add the documentation server to Claude Code for AI-assisted development:
+claude mcp add --transport http nmiai https://mcp-docs.ainm.no/mcp

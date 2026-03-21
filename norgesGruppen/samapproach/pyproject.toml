@@ -1,0 +1,14 @@
+[project]
+name = "samapproach"
+version = "0.1.0"
+description = "SAM3 + DINOv2 shelf product matching pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.7.0",
+    "torchvision>=0.22.0",
+    "pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "matplotlib>=3.8.0",
+    "tqdm>=4.66.0",
+    "huggingface-hub>=0.20.0",
+]
