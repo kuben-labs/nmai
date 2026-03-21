@@ -238,9 +238,9 @@ async def solve(request: Request):
                 f"[{request_id}] ⚠ Missing Tripletex credentials in request!"
             )
 
-        # Run the accounting task workflow with 280s timeout (20s buffer before 300s hard limit)
+        # Run the accounting task workflow with 300s timeout (20s buffer before 300s hard limit)
         logger.info(f"[{request_id}] ⏳ Starting accounting task execution...")
-        logger.info(f"[{request_id}] Timeout: 280s (300s spec limit - 20s buffer)")
+        logger.info(f"[{request_id}] Timeout: 300s (300s spec limit - 20s buffer)")
         task_start = asyncio.get_event_loop().time()
 
         try:
@@ -250,12 +250,12 @@ async def solve(request: Request):
                     file_content=extracted_file_content,
                     tripletex_credentials=tripletex_credentials,
                 ),
-                timeout=300.0,  # 280s timeout, 20s buffer before 300s hard limit
+                timeout=300.0,  # 300s timeout, 20s buffer before 300s hard limit
             )
         except asyncio.TimeoutError:
             task_elapsed = asyncio.get_event_loop().time() - task_start
             logger.error(
-                f"[{request_id}] ⏱ TIMEOUT after {task_elapsed:.2f}s - task exceeded 280s limit"
+                f"[{request_id}] ⏱ TIMEOUT after {task_elapsed:.2f}s - task exceeded 300s limit"
             )
             logger.info(
                 f"[{request_id}] ✓ Returning HTTP 200 with spec-compliant response"
