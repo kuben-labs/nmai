@@ -103,6 +103,9 @@ ESSENTIAL_TOOLS = {
     "Division_search",
     "Division_post",
     "LedgerVatType_search",
+    "LedgerAccount_put",
+    "Company_get",
+    "InvoiceSend_send",
     # Credit notes and reversals
     "InvoiceCreateCreditNote_createCreditNote",
     "LedgerVoucherReverse_reverse",
