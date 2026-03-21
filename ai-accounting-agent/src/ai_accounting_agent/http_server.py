@@ -1,5 +1,6 @@
 """FastAPI HTTP server for Tripletex accounting agent."""
 
+import json
 import os
 import asyncio
 from typing import Optional, List, Dict, Any
@@ -107,17 +108,20 @@ async def solve(request: Request):
     {"status": "completed"}
     """
     request_id = request.headers.get("x-request-id", "unknown")
-    logger.info(f"[{request_id}] Received /solve request")
+    logger.info(f"\n{'=' * 80}")
+    logger.info(f"[{request_id}] 📤 RECEIVED REQUEST FROM COMPETITION")
+    logger.info(f"{'=' * 80}")
 
     try:
         # Parse request
         body = await request.json()
-        logger.debug(f"[{request_id}] Request body parsed")
+        logger.debug(f"[{request_id}] Request body parsed successfully")
 
         # Validate required fields
         prompt = body.get("prompt")
         if not prompt:
-            logger.error(f"[{request_id}] Missing required field: prompt")
+            logger.error(f"[{request_id}] ❌ Missing required field: prompt")
+            logger.info(f"[{request_id}] Returning HTTP 200 (spec compliance)")
             return JSONResponse(
                 status_code=200,
                 content={"status": "completed"},
@@ -127,14 +131,32 @@ async def solve(request: Request):
         files = body.get("files", [])
         tripletex_credentials = body.get("tripletex_credentials", {})
 
-        logger.info(f"[{request_id}] Task prompt: {prompt[:100]}...")
-        logger.info(f"[{request_id}] Files: {len(files)}")
+        # Log incoming request details
+        logger.info(f"[{request_id}] ✓ Prompt received: {prompt[:80]}...")
+        logger.info(f"[{request_id}] ✓ Files attached: {len(files)}")
+        if files:
+            for i, f in enumerate(files, 1):
+                logger.info(
+                    f"[{request_id}]   - File {i}: {f.get('filename')} ({f.get('mime_type')})"
+                )
+
+        base_url = tripletex_credentials.get("base_url", "")
+        session_token = tripletex_credentials.get("session_token", "")
+        logger.info(f"[{request_id}] ✓ Credentials received:")
+        logger.info(f"[{request_id}]   - base_url: {base_url}")
+        logger.info(
+            f"[{request_id}]   - session_token: {session_token[:20]}..."
+            if session_token
+            else f"[{request_id}]   - session_token: [MISSING]"
+        )
 
         # Process attached files if any
         file_data = None
         extracted_file_content = ""
         if files:
-            logger.info(f"[{request_id}] Processing {len(files)} attached files...")
+            logger.info(
+                f"[{request_id}] 📦 Processing {len(files)} attached file(s)..."
+            )
             file_data = FileProcessor.process_files(files)
             logger.debug(
                 f"[{request_id}] File processing result: {file_data.get('success')}"
@@ -153,13 +175,14 @@ async def solve(request: Request):
                 if file_contents:
                     extracted_file_content = "\n\n".join(file_contents)
                     logger.info(
-                        f"[{request_id}] Extracted {len(file_contents)} file(s) content for agent"
+                        f"[{request_id}] ✓ Extracted {len(file_contents)} file(s) content ({len(extracted_file_content)} chars)"
                     )
+            else:
+                logger.warning(
+                    f"[{request_id}] ⚠ File processing failed or returned no content"
+                )
 
         # Set up Tripletex client with per-request credentials
-        base_url = tripletex_credentials.get("base_url", "")
-        session_token = tripletex_credentials.get("session_token", "")
-
         if base_url and session_token:
             # Set dynamic credentials for this request
             set_tripletex_client(base_url, session_token)
@@ -167,13 +190,16 @@ async def solve(request: Request):
             os.environ["TRIPLETEX_BASE_URL"] = base_url
             os.environ["TRIPLETEX_SESSION_TOKEN"] = session_token
             logger.info(
-                f"[{request_id}] Configured Tripletex client with request credentials"
+                f"[{request_id}] ✓ Configured Tripletex client with provided credentials"
             )
         else:
-            logger.warning(f"[{request_id}] Missing Tripletex credentials in request!")
+            logger.warning(
+                f"[{request_id}] ⚠ Missing Tripletex credentials in request!"
+            )
 
         # Run the accounting task workflow with 280s timeout (20s buffer before 300s hard limit)
-        logger.info(f"[{request_id}] Starting accounting task workflow...")
+        logger.info(f"[{request_id}] ⏳ Starting accounting task execution...")
+        logger.info(f"[{request_id}] Timeout: 280s (300s spec limit - 20s buffer)")
         task_start = asyncio.get_event_loop().time()
 
         try:
@@ -187,32 +213,51 @@ async def solve(request: Request):
             )
         except asyncio.TimeoutError:
             task_elapsed = asyncio.get_event_loop().time() - task_start
-            logger.error(f"[{request_id}] Task timed out after {task_elapsed:.2f}s")
+            logger.error(
+                f"[{request_id}] ⏱ TIMEOUT after {task_elapsed:.2f}s - task exceeded 280s limit"
+            )
             await cleanup_tripletex_client()
+            logger.info(
+                f"[{request_id}] ✓ Returning HTTP 200 with spec-compliant response"
+            )
             return JSONResponse(
                 status_code=200,
                 content={"status": "completed"},  # Return completed to avoid penalty
             )
 
         task_elapsed = asyncio.get_event_loop().time() - task_start
-        logger.info(f"[{request_id}] Task workflow completed in {task_elapsed:.2f}s")
+        logger.info(f"[{request_id}] ✓ Task execution completed in {task_elapsed:.2f}s")
 
         # Clean up client
         await cleanup_tripletex_client()
 
         # Always return completed per spec
-        logger.info(f"[{request_id}] Task workflow finished")
+        logger.info(f"[{request_id}] 📥 RESPONSE TO COMPETITION:")
+        logger.info(f"[{request_id}] Status Code: HTTP 200")
+        logger.info(f"[{request_id}] Body: {json.dumps({'status': 'completed'})}")
+        logger.info(f"[{request_id}] ✓ SPEC COMPLIANT")
+        logger.info(f"{'=' * 80}\n")
         return JSONResponse(status_code=200, content={"status": "completed"})
 
     except ValueError as e:
-        logger.error(f"[{request_id}] Validation error: {e}")
+        logger.error(f"[{request_id}] ❌ Validation error: {e}")
+        logger.info(f"[{request_id}] 📥 RESPONSE TO COMPETITION (Error case):")
+        logger.info(f"[{request_id}] Status Code: HTTP 200")
+        logger.info(f"[{request_id}] Body: {json.dumps({'status': 'completed'})}")
+        logger.info(f"[{request_id}] ✓ SPEC COMPLIANT (errors return 200)")
+        logger.info(f"{'=' * 80}\n")
         return JSONResponse(
             status_code=200,
             content={"status": "completed"},
         )
 
     except Exception as e:
-        logger.error(f"[{request_id}] Unexpected error: {e}", exc_info=True)
+        logger.error(f"[{request_id}] ❌ Unexpected error: {e}", exc_info=True)
+        logger.info(f"[{request_id}] 📥 RESPONSE TO COMPETITION (Exception case):")
+        logger.info(f"[{request_id}] Status Code: HTTP 200")
+        logger.info(f"[{request_id}] Body: {json.dumps({'status': 'completed'})}")
+        logger.info(f"[{request_id}] ✓ SPEC COMPLIANT (exceptions return 200)")
+        logger.info(f"{'=' * 80}\n")
         return JSONResponse(
             status_code=200,
             content={"status": "completed"},
