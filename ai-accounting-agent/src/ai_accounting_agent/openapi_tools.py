@@ -197,6 +197,7 @@ def generate_tools_from_openapi(
         List of Tool objects ready to use with Agent
     """
     tools = []
+    used_names: set = set()
     all_defs = spec.get("components", {}).get("schemas", {})
     # Merge top-level $defs if any
     top_defs = spec.get("$defs", {})
@@ -214,12 +215,35 @@ def generate_tools_from_openapi(
             if not operation_id:
                 continue
 
-            # Convert operationId to tool name (FastMCP style)
+            # Convert operationId to tool name
             # e.g. "[Employee_post]" -> "Employee_post"
             tool_name = operation_id.strip("[]").replace(" ", "_")
 
-            # Filter if specified
-            if tool_filter and tool_name not in tool_filter:
+            # Gemini requires: start with [a-zA-Z_], then [a-zA-Z0-9_.:- ], max 64 chars
+            import re
+
+            tool_name = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", tool_name)
+            if tool_name and not re.match(r"^[a-zA-Z_]", tool_name):
+                tool_name = f"t_{tool_name}"
+            if len(tool_name) > 64:
+                tool_name = tool_name[:64]
+
+            # Deduplicate
+            if tool_name in used_names:
+                for i in range(2, 100):
+                    candidate = f"{tool_name[:61]}_{i}"
+                    if candidate not in used_names:
+                        tool_name = candidate
+                        break
+            used_names.add(tool_name)
+
+            # Filter if specified — check both sanitized name and original operationId
+            original_name = operation_id.strip("[]").replace(" ", "_")
+            if (
+                tool_filter
+                and tool_name not in tool_filter
+                and original_name not in tool_filter
+            ):
                 continue
 
             description = operation.get("summary", "") or operation.get(

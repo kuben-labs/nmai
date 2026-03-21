@@ -43,6 +43,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "ai-accountant-mcp" },
+    { name = "anthropic", extra = ["vertex"] },
     { name = "fastapi" },
     { name = "google-genai" },
     { name = "lancedb" },
@@ -57,12 +58,13 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "ai-accountant-mcp", directory = "ai-accountant-mcp" },
+    { name = "anthropic", extras = ["vertex"], specifier = ">=0.40.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "google-genai", specifier = ">=1.68.0" },
     { name = "lancedb", specifier = ">=0.30.1" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "pdfplumber", specifier = ">=0.11.0" },
-    { name = "pydantic-ai", specifier = ">=1.70.0" },
+    { name = "pydantic-ai", extras = ["google", "anthropic"], specifier = ">=1.70.0" },
     { name = "pypdf2", specifier = ">=3.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "uvicorn", specifier = ">=0.32.0" },
@@ -204,6 +206,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/37/7a/8b390dc47945d3169875d342847431e5f7d5fa716b2e37494d57cfc1db10/anthropic-0.86.0.tar.gz", hash = "sha256:60023a7e879aa4fbb1fed99d487fe407b2ebf6569603e5047cfe304cebdaa0e5", size = 583820, upload-time = "2026-03-18T18:43:08.017Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/63/5f/67db29c6e5d16c8c9c4652d3efb934d89cb750cad201539141781d8eae14/anthropic-0.86.0-py3-none-any.whl", hash = "sha256:9d2bbd339446acce98858c5627d33056efe01f70435b22b63546fe7edae0cd57", size = 469400, upload-time = "2026-03-18T18:43:06.526Z" },
+]
+
+[package.optional-dependencies]
+vertex = [
+    { name = "google-auth", extra = ["requests"] },
 ]
 
 [[package]]
