@@ -42,7 +42,9 @@ Description:
 
 CONTEXT:
 Task: {main_task}
-Credentials: Provided in MCP connection
+Credentials Provided:
+- Base URL: {base_url}
+- Session Token: {session_token}
 
 INSTRUCTIONS:
 1. Understand what needs to be done from the description
@@ -99,4 +101,24 @@ After each operation completes, verify:
 - All required fields are set
 - Relationships are properly linked
 - No unexpected errors occurred
+"""
+
+ACCOUNTING_COORDINATOR_PROMPT_TEMPLATE = """
+You are executing an accounting task for Tripletex.
+
+TASK:
+{task_description}
+
+CREDENTIALS PROVIDED:
+- Base URL: {base_url}
+- Session Token: {session_token}
+
+INSTRUCTIONS:
+1. Analyze the task and understand what needs to be accomplished
+2. Use available MCP tools to execute the required operations
+3. Validate all results and confirm success
+4. Handle any errors with one correction attempt
+5. Report what was accomplished
+
+Execute the task efficiently and verify all operations completed successfully.
 """

@@ -9,6 +9,7 @@ from .prompts import (
     ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
     ACCOUNTING_SUBAGENT_PROMPT_TEMPLATE,
     ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
+    ACCOUNTING_COORDINATOR_PROMPT_TEMPLATE,
 )
 import os
 
@@ -34,11 +35,18 @@ class AccountingSubAgent(BaseAgent):
             main_task: The overall accounting task
             tripletex_credentials: Tripletex API credentials (base_url, session_token)
         """
+        base_url = (tripletex_credentials or {}).get(
+            "base_url", "https://api.tripletex.no/v2"
+        )
+        session_token = (tripletex_credentials or {}).get("session_token", "")
+
         prompt = ACCOUNTING_SUBAGENT_PROMPT_TEMPLATE.format(
             subtask_id=subtask_id,
             subtask_title=subtask_title,
             subtask_description=subtask_description,
             main_task=main_task,
+            base_url=base_url,
+            session_token=session_token,
         )
 
         super().__init__(
@@ -214,8 +222,63 @@ class CoordinatorAgent(BaseAgent):
         """Required abstract method implementation."""
         return await self.coordinate_execution()
 
+    async def coordinate_execution(self) -> str:
+        """
+        Execute the accounting task directly with RAG filtering.
+
+        Returns:
+            Summary of execution results
+        """
+        logger.info(f"Coordinator executing task: {self.task_summary[:100]}")
+
+        try:
+            # Initialize RAG filtering on first execution
+            if self.use_rag_filtering and not self._rag_initialized:
+                await self._initialize_rag_filtering()
+
+            # Create the prompt for execution with credentials
+            base_url = self.tripletex_credentials.get(
+                "base_url", "https://api.tripletex.no/v2"
+            )
+            session_token = self.tripletex_credentials.get("session_token", "")
+
+            execution_prompt = ACCOUNTING_COORDINATOR_PROMPT_TEMPLATE.format(
+                task_description=self.task_summary,
+                base_url=base_url,
+                session_token=session_token,
+            )
+
+            # Execute task directly using the coordinator's tools (now RAG-filtered)
+            logger.info("Executing task with RAG-filtered tools")
+            result = await self.run_query(execution_prompt)
+
+            # Extract result
+            if hasattr(result, "data"):
+                report = result.data
+            elif hasattr(result, "output"):
+                report = result.output
+            else:
+                report = str(result)
+
+            return f"""
+# Task Execution Report
+
+## Task
+{self.task_summary}
+
+## Result
+{report}
+
+## Status
+Completed
+"""
+
+        except Exception as e:
+            logger.error(f"Coordinator error: {e}")
+            raise
+
     async def _initialize_rag_filtering(self):
-        """Initialize RAG filtering for the coordinator."""
+        """Initialize RAG filtering for this coordinator execution."""
         try:
             logger.info("Coordinator: Initializing RAG tool filtering...")
 
@@ -233,7 +296,7 @@ class CoordinatorAgent(BaseAgent):
             # Create RAG manager
             self.rag_manager = create_rag_tool_manager(
                 embedding_provider=embedding_provider,
-                top_k=300,
+                top_k=500,  # Return top tools for filtering
             )
 
             # Initialize RAG manager
@@ -248,14 +311,13 @@ class CoordinatorAgent(BaseAgent):
 
                 stats = self.rag_manager.get_statistics()
                 logger.info(
-                    f"Coordinator: RAG initialized with {stats.get('total_tools', 0)} tools, "
-                    f"will filter to ~300 most relevant"
+                    f"Coordinator: RAG initialized with {stats.get('total_tools', 0)} tools"
                 )
 
-            # Create filtered toolsets
+            # Create filtered toolsets based on task
             if self._original_toolsets and self.rag_manager:
                 filtered_toolsets = await self.rag_manager.create_filtered_toolsets(
-                    self._original_toolsets, "Coordinating accounting task"
+                    self._original_toolsets, self.task_summary[:200]
                 )
                 self.toolsets = filtered_toolsets
 
@@ -280,119 +342,6 @@ class CoordinatorAgent(BaseAgent):
             logger.warning(f"Coordinator: RAG filtering initialization failed: {e}")
             self.use_rag_filtering = False
             return False
-
-    async def coordinate_execution(self) -> str:
-        """
-        Coordinate all sub-agents and verify results.
-
-        Returns:
-            Summary of execution results
-        """
-        logger.info(f"Coordinator starting execution of {len(self.subtasks)} subtasks")
-        logger.info(f"Task type: {self.task_type}, Complexity: {self.complexity}")
-
-        # Initialize RAG on first execution
-        if self.use_rag_filtering and not self._rag_initialized:
-            await self._initialize_rag_filtering()
-
-        try:
-            # Execute task directly - coordinator uses single sub-agent
-            logger.info("Executing task with main agent")
-            return await self._execute_simple_task()
-
-        except Exception as e:
-            logger.error(f"Coordinator error: {e}")
-            raise
-
-    async def _execute_simple_task(self) -> str:
-        """Execute a simple task (1-2 API calls)."""
-        try:
-            # For simple tasks, we still use a single sub-agent
-            if self.subtasks:
-                first_subtask = self.subtasks[0]
-                subagent = AccountingSubAgent(
-                    subtask_id=first_subtask.get("id", "main"),
-                    subtask_title=first_subtask.get("title", "Main Task"),
-                    subtask_description=first_subtask.get("description", ""),
-                    main_task=self.task_summary,
-                    tripletex_credentials=self.tripletex_credentials,
-                )
-
-                logger.info("Executing simple task...")
-                result = await subagent.execute()
-
-                return f"""
-# Task Execution Report
-
-## Task Summary
-{self.task_summary}
-
-## Result
-{result}
-
-## Status
-Completed
-"""
-
-        except Exception as e:
-            logger.error(f"Error executing simple task: {e}")
-            raise
-
-    async def _execute_complex_task(self) -> str:
-        """Execute a complex task with multiple parallel sub-agents."""
-        try:
-            # Create sub-agents for each subtask
-            subagents = []
-            for subtask in self.subtasks:
-                subagent = AccountingSubAgent(
-                    subtask_id=subtask.get("id", "unknown"),
-                    subtask_title=subtask.get("title", "Subtask"),
-                    subtask_description=subtask.get("description", ""),
-                    main_task=self.task_summary,
-                    tripletex_credentials=self.tripletex_credentials,
-                )
-                subagents.append((subtask, subagent))
-
-            # Execute sub-agents
-            # Note: In a real system, we'd respect dependencies, but for now we run all in parallel
-            logger.info(f"Starting {len(subagents)} sub-agents in parallel...")
-
-            tasks = [agent.execute() for _, agent in subagents]
-            sub_reports = await asyncio.gather(*tasks)
-
-            # Compile results
-            logger.info("Coordinator compiling execution reports...")
-
-            execution_summary = "## Sub-Task Execution Results\n\n"
-            for (subtask, _), report in zip(subagents, sub_reports):
-                execution_summary += f"### {subtask.get('id', 'unknown')}: {subtask.get('title', 'Task')}\n"
-                execution_summary += f"{report}\n\n"
-
-            # Create final verification summary
-            final_report = f"""
-# Accounting Task Execution Report
-
-## Task Summary
-{self.task_summary}
-
-## Classification
-- Type: {self.task_type}
-- Complexity: {self.complexity}
-
-## Execution Status
-
-{execution_summary}
-
-## Overall Status
-Task execution coordinated and completed.
-"""
-
-            logger.info("Coordinator completed execution")
-            return final_report
-
-        except Exception as e:
-            logger.error(f"Error executing complex task: {e}")
-            raise
 
 
 async def run_accounting_task(
