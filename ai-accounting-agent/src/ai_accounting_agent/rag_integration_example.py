@@ -14,7 +14,7 @@ from .rag_tool_manager import create_rag_tool_manager
 
 async def run_accounting_task_with_rag(
     prompt: str,
-    files: Optional[list] = None,
+    file_content: str = "",
     tripletex_credentials: Optional[dict] = None,
     use_rag_filtering: bool = True,
     top_k: int = 300,
@@ -26,7 +26,7 @@ async def run_accounting_task_with_rag(
 
     Args:
         prompt: The accounting task prompt
-        files: Optional list of attached files
+        file_content: Extracted content from attached files (PDF text, OCR, etc.)
         tripletex_credentials: Tripletex API credentials
         use_rag_filtering: Whether to use RAG filtering (default: True)
         top_k: Number of top tools to return if using RAG
@@ -71,7 +71,7 @@ async def run_accounting_task_with_rag(
     # Run the accounting task (existing workflow)
     result = await run_accounting_task(
         prompt=prompt,
-        files=files if files is not None else [],
+        file_content=file_content,
         tripletex_credentials=tripletex_credentials
         if tripletex_credentials is not None
         else {},
@@ -106,7 +106,7 @@ async def demo_rag_filtering():
         try:
             result = await run_accounting_task_with_rag(
                 prompt=task,
-                files=[],
+                file_content="",
                 tripletex_credentials={},
                 use_rag_filtering=True,
                 top_k=300,

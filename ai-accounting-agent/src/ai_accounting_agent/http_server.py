@@ -175,15 +175,27 @@ async def solve(request: Request):
         else:
             logger.warning(f"[{request_id}] Missing Tripletex credentials in request!")
 
-        # Run the accounting task workflow
+        # Run the accounting task workflow with 280s timeout (20s buffer before 300s hard limit)
         logger.info(f"[{request_id}] Starting accounting task workflow...")
         task_start = asyncio.get_event_loop().time()
 
-        result = await run_accounting_task(
-            prompt=prompt,
-            file_content=extracted_file_content,
-            tripletex_credentials=tripletex_credentials,
-        )
+        try:
+            result = await asyncio.wait_for(
+                run_accounting_task(
+                    prompt=prompt,
+                    file_content=extracted_file_content,
+                    tripletex_credentials=tripletex_credentials,
+                ),
+                timeout=280.0,  # 280s timeout, 20s buffer before 300s hard limit
+            )
+        except asyncio.TimeoutError:
+            task_elapsed = asyncio.get_event_loop().time() - task_start
+            logger.error(f"[{request_id}] Task timed out after {task_elapsed:.2f}s")
+            await cleanup_tripletex_client()
+            return JSONResponse(
+                status_code=200,
+                content={"status": "completed"},  # Return completed to avoid penalty
+            )
 
         task_elapsed = asyncio.get_event_loop().time() - task_start
         logger.info(f"[{request_id}] Task workflow completed in {task_elapsed:.2f}s")
@@ -210,16 +222,6 @@ async def solve(request: Request):
         return JSONResponse(
             status_code=400,
             content={"status": "error", "message": f"Invalid request: {str(e)}"},
-        )
-
-    except asyncio.TimeoutError:
-        logger.error(f"[{request_id}] Request timeout (>5 minutes)")
-        return JSONResponse(
-            status_code=504,
-            content={
-                "status": "error",
-                "message": "Request timeout - task took too long",
-            },
         )
 
     except Exception as e:

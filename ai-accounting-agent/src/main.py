@@ -103,7 +103,7 @@ class ChatAgent(BaseAgent):
             # Create RAG manager
             self.rag_manager = create_rag_tool_manager(
                 embedding_provider=embedding_provider,
-                top_k=500,  # Return top 300 tools - balance between context size and tool availability
+                top_k=300,  # Return top 300 tools - balance between context size and tool availability
             )
 
             # Initialize RAG manager

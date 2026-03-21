@@ -299,7 +299,7 @@ Completed
             # Create RAG manager
             self.rag_manager = create_rag_tool_manager(
                 embedding_provider=embedding_provider,
-                top_k=500,  # Return top tools for filtering
+                top_k=300,  # Return top tools for filtering
             )
 
             # Initialize RAG manager

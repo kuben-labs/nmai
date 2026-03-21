@@ -35,7 +35,7 @@ async def main():
         logger.info("Starting accounting task workflow...")
 
         result = await run_accounting_task(
-            prompt=task, files=[], tripletex_credentials={}
+            prompt=task, file_content="", tripletex_credentials={}
         )
 
         # Print results
