@@ -1,5 +1,21 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  	"watcher": {
+		"ignore": [
+			"accounting/**",
+			"ai-accounting-agent/**",
+			".git/**",
+			"astarIsland/**",
+			"computervision/**",
+			"norgesGruppen/**"
+		]
+	},
+	"instructions": [
+		"CONTRIBUTING.md",
+		"detection/docs/**",
+		".github/instructions/*.md",
+		".github/copilot-instructions.md"
+	],
   "provider": {
     "google-vertex-anthropic": {
       "models": {

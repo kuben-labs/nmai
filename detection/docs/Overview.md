@@ -56,9 +56,9 @@ The COCO annotations file (annotations.json) contains:
 }
 Key fields: bbox is [x, y, width, height] in pixels (COCO format). product_code is the barcode. corrected indicates manually verified annotations.
 What Annotations Look Like
-A training image with all ground truth boxes (green = correctly detected product):
+A training image with all ground truth boxes (green = correctly detected product): ![Ground Truth Annotations](ground%20truth%20boxes.png)
 
-Compare with a ~50% mAP result — half the products are missed entirely, and some detected boxes (red) are imprecise:
+Compare with a ~50% mAP result — half the products are missed entirely, and some detected boxes (red) are imprecise: ![Detection Result](50mAp.png)
 
 Submit
 Upload your .zip at the submission page on the competition website.
