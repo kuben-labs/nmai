@@ -592,11 +592,25 @@ class RAGToolFilter(AbstractToolset):
                 raise ValueError(error_msg)
 
             # Delegate to wrapped toolset with correct signature
-            return await self.wrapped_toolset.call_tool(name, tool_args, ctx, tool)
+            result = await self.wrapped_toolset.call_tool(name, tool_args, ctx, tool)
 
-        except Exception as e:
-            logger.error(f"Error calling tool {name}: {e}")
+            # Handle empty responses - return empty string or object as appropriate
+            if result is None:
+                # Return appropriate empty value based on tool return type
+                return "" if tool.return_type == str else {}
+
+            return result
+
+        except ValueError:
+            # Re-raise ValueError as-is (tool not in relevant set)
             raise
+        except Exception as e:
+            # For other errors (API errors, validation errors), log as warning and return empty value
+            logger.warning(
+                f"Tool {name} returned error (treating as empty response): {e}"
+            )
+            # Return appropriate empty value based on tool return type
+            return "" if tool.return_type == str else {}
 
     def __getattr__(self, name):
         """Delegate all other attributes to the wrapped toolset."""
