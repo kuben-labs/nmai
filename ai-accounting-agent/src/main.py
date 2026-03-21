@@ -18,10 +18,20 @@ agent_config = AgentConfig(
     max_iterations=3, timeout=60000, max_tool_retries=3, allow_sampling=True
 )
 
-SYSTEM_PROMPT = """You are a helpful AI assistant with access to various tools. 
+SYSTEM_PROMPT = """You are a helpful AI assistant with access to various tools. You are an agent for doing rather than asking any questions. You have access to tools that you can use to answer the user's question. Use them when needed without asking for permission. Just do whatever is needed to answer the query.
+
 <Instructions>
-You use your tools to assist the use in an autonomous manner. if you want to try another way to answer the query, do it without asking for permission.
+You use your tools to assist the use in an autonomous manner. if you want to try another way to answer the query, do it without asking for permission. you have access to tools that you can use to answer the user's question. Use them when needed without asking for permission.
 </Instructions>
+
+<Instructions>
+These tools sometimes require specific input formats. Make sure to follow the tool documentation for input formatting. If a tool fails, you can retry with corrected input up to 30 times.
+</Instructions>
+
+<Instructions>
+Some tools dont return useful output and you might need to use another tool to confirm the success of the previous tool. You can use tools to check the output of other tools and retry if needed.
+</Instructions>
+
 
 <Instructions>
 Do not ask the user for permission to use your tools.
@@ -33,10 +43,6 @@ Do not ask for the user feedback or input to answer the query.
 
 <Instructions>
 Just do whatever is needed to answer the query.
-</Instructions>
-
-<Instructions>
-You like to always make things visual when you can. Especially when you are responding to the user.
 </Instructions>
 """
 
@@ -97,7 +103,7 @@ class ChatAgent(BaseAgent):
             # Create RAG manager
             self.rag_manager = create_rag_tool_manager(
                 embedding_provider=embedding_provider,
-                top_k=50,  # Return top 50 relevant tools per query
+                top_k=500,  # Return top 300 tools - balance between context size and tool availability
             )
 
             # Initialize RAG manager
@@ -111,7 +117,7 @@ class ChatAgent(BaseAgent):
                 stats = self.rag_manager.get_statistics()
                 logger.info(
                     f"RAG initialized: indexed {stats.get('total_tools', 0)} tools, "
-                    f"will filter to ~50 most relevant per query"
+                    f"will filter to ~300 most relevant per query"
                 )
 
             self._rag_initialized = True
@@ -183,10 +189,12 @@ async def interactive_cli():
     print("Agent ready!\n")
     print("💡 RAG Tool Filtering Enabled:")
     print(
-        "   • First query: Initializes embeddings and filters 800 tools → 50 most relevant"
+        "   • First query: Initializes embeddings and filters 800 tools → 300 most relevant"
     )
     print("   • Subsequent queries: Filters tools per query using semantic similarity")
-    print("   • Result: ~95% reduction in context size (400K → 5K tokens)\n")
+    print(
+        "   • Result: Context size balanced (supports complex tasks while managing limits)\n"
+    )
 
     while True:
         try:
