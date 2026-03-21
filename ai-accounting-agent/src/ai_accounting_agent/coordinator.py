@@ -114,7 +114,7 @@ class AccountingSubAgent(BaseAgent):
             # Create RAG manager
             self.rag_manager = create_rag_tool_manager(
                 embedding_provider=embedding_provider,
-                top_k=50,
+                top_k=300,
             )
 
             # Initialize RAG manager
@@ -130,7 +130,7 @@ class AccountingSubAgent(BaseAgent):
                 stats = self.rag_manager.get_statistics()
                 logger.info(
                     f"SubAgent {self.subtask_id}: RAG initialized with {stats.get('total_tools', 0)} tools, "
-                    f"will filter to ~50 most relevant per subtask"
+                    f"will filter to ~300 most relevant per subtask"
                 )
 
             # Create filtered toolsets for this subtask
@@ -234,7 +234,7 @@ class CoordinatorAgent(BaseAgent):
             # Create RAG manager
             self.rag_manager = create_rag_tool_manager(
                 embedding_provider=embedding_provider,
-                top_k=50,
+                top_k=300,
             )
 
             # Initialize RAG manager
@@ -250,7 +250,7 @@ class CoordinatorAgent(BaseAgent):
                 stats = self.rag_manager.get_statistics()
                 logger.info(
                     f"Coordinator: RAG initialized with {stats.get('total_tools', 0)} tools, "
-                    f"will filter to ~50 most relevant"
+                    f"will filter to ~300 most relevant"
                 )
 
             # Create filtered toolsets

@@ -17,7 +17,7 @@ async def run_accounting_task_with_rag(
     files: Optional[list] = None,
     tripletex_credentials: Optional[dict] = None,
     use_rag_filtering: bool = True,
-    top_k: int = 50,
+    top_k: int = 300,
 ) -> Dict[str, Any]:
     """Run an accounting task with optional RAG-based tool filtering.
 
@@ -109,7 +109,7 @@ async def demo_rag_filtering():
                 files=[],
                 tripletex_credentials={},
                 use_rag_filtering=True,
-                top_k=50,
+                top_k=300,
             )
 
             if result["success"]:
@@ -131,7 +131,7 @@ async def benchmark_context_reduction():
     # Assumptions
     total_tools = 800
     tokens_per_tool = 500  # Average tokens for tool description
-    relevant_tools = 50
+    relevant_tools = 300
 
     tokens_without_rag = total_tools * tokens_per_tool
     tokens_with_rag = relevant_tools * tokens_per_tool

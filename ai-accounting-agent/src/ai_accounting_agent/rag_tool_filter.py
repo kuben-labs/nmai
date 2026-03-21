@@ -268,7 +268,7 @@ class ToolVectorStore:
         self.tools[tool.name] = tool
 
     def find_similar_tools(
-        self, query_embedding: List[float], top_k: int = 50
+        self, query_embedding: List[float], top_k: int = 300
     ) -> List[Tuple[str, float]]:
         """Find similar tools using LanceDB vector search.
 
@@ -331,7 +331,7 @@ class RAGToolFilter(AbstractToolset):
         vector_store: ToolVectorStore,
         embedder: ToolEmbedder,
         task_prompt: str,
-        top_k: int = 50,
+        top_k: int = 300,
     ):
         """Initialize the RAG tool filter.
 
@@ -665,7 +665,7 @@ async def create_filtered_toolsets(
     vector_store: ToolVectorStore,
     embedder: ToolEmbedder,
     task_prompt: str,
-    top_k: int = 50,
+    top_k: int = 300,
 ) -> List[RAGToolFilter]:
     """Create filtered versions of toolsets for a specific task.
 

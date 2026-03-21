@@ -27,7 +27,7 @@ class RAGToolManager:
         self,
         embedding_provider: Optional[Any] = None,
         vector_store_path: str = ".tool_embeddings",
-        top_k: int = 50,
+        top_k: int = 300,
     ):
         """Initialize the RAG tool manager.
 
@@ -225,7 +225,7 @@ class RAGToolManager:
 def create_rag_tool_manager(
     embedding_provider: Optional[Any] = None,
     vector_store_path: str = ".tool_embeddings",
-    top_k: int = 50,
+    top_k: int = 300,
 ) -> RAGToolManager:
     """Factory function to create a RAG tool manager.
 
