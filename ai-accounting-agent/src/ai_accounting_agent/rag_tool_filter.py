@@ -313,6 +313,71 @@ async def index_mcp_tools(
     logger.info(f"Tool indexing complete: {total_tools} tools indexed")
 
 
+async def index_openapi_tools(
+    spec: Dict[str, Any],
+    vector_store: ToolVectorStore,
+    embedder: ToolEmbedder,
+) -> None:
+    """Index tools from an OpenAPI spec into the vector store.
+
+    This replaces index_mcp_tools for the direct-API architecture.
+    Extracts tool names and descriptions from the OpenAPI spec's
+    operation IDs and summaries.
+
+    Args:
+        spec: Parsed OpenAPI spec JSON
+        vector_store: The vector store to populate
+        embedder: The embedder to use for creating embeddings
+    """
+    logger.info("Starting OpenAPI tool indexing...")
+
+    tool_metadata_list = []
+    paths = spec.get("paths", {})
+
+    for path, path_item in paths.items():
+        for method in ["get", "post", "put", "delete", "patch"]:
+            operation = path_item.get(method)
+            if not operation:
+                continue
+
+            operation_id = operation.get("operationId", "")
+            if not operation_id:
+                continue
+
+            tool_name = operation_id.strip("[]").replace(" ", "_")
+            description = operation.get("summary", "") or operation.get(
+                "description", ""
+            )
+            if not description:
+                description = f"{method.upper()} {path}"
+
+            # Build a simple representation for embedding
+            params = {}
+            for param in operation.get("parameters", []):
+                name = param.get("name", "")
+                if name:
+                    params[name] = param.get("schema", {}).get("type", "string")
+
+            tool_metadata = ToolMetadata(
+                name=tool_name,
+                description=description,
+                parameters=params,
+            )
+            tool_metadata_list.append(tool_metadata)
+
+    logger.info(f"Found {len(tool_metadata_list)} tools in OpenAPI spec")
+
+    # Embed in batches
+    embedded_tools = await embedder.embed_tools_batch(tool_metadata_list, batch_size=32)
+
+    # Store
+    for tool in embedded_tools:
+        vector_store.add_tool(tool)
+
+    vector_store._save_to_disk()
+    logger.info(f"OpenAPI tool indexing complete: {len(embedded_tools)} tools indexed")
+
+
 async def get_relevant_tool_names(
     vector_store: ToolVectorStore,
     embedder: ToolEmbedder,

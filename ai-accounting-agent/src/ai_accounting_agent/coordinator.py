@@ -156,15 +156,31 @@ async def _get_rag_manager():
     return _rag_manager
 
 
-async def _get_relevant_tool_names(task_prompt: str) -> Set[str]:
-    """Get relevant tool names via RAG + essential tools."""
+async def _get_relevant_tool_names(task_prompt: str, spec: Dict[str, Any]) -> Set[str]:
+    """Get relevant tool names via RAG + essential tools.
+
+    If the RAG index is empty (first run or cleared), rebuilds it
+    from the OpenAPI spec.
+    """
     rag_manager = await _get_rag_manager()
 
-    # Check if tools are indexed
+    # If no tools indexed, rebuild from OpenAPI spec
     stats = rag_manager.get_statistics()
     if stats.get("total_tools", 0) == 0:
-        logger.warning("No tools indexed in RAG, returning essential tools only")
-        return ESSENTIAL_TOOLS
+        logger.info("RAG index empty, rebuilding from OpenAPI spec...")
+        from .rag_tool_filter import index_openapi_tools
+
+        if rag_manager.vector_store and rag_manager.embedder:
+            await index_openapi_tools(
+                spec=spec,
+                vector_store=rag_manager.vector_store,
+                embedder=rag_manager.embedder,
+            )
+        else:
+            logger.warning(
+                "No vector store or embedder, returning essential tools only"
+            )
+            return ESSENTIAL_TOOLS
 
     relevant_names = await rag_manager.get_relevant_names(task_prompt, top_k=200)
     relevant_names = relevant_names | ESSENTIAL_TOOLS
@@ -221,7 +237,7 @@ Use the information from the attached files above to complete the task."""
         spec = await _get_openapi_spec(base_url, session_token)
 
         # 2. Get relevant tool names via RAG
-        relevant_names = await _get_relevant_tool_names(full_prompt)
+        relevant_names = await _get_relevant_tool_names(full_prompt, spec)
 
         # 3. Generate tools from spec (filtered to relevant ones)
         tools = generate_tools_from_openapi(
