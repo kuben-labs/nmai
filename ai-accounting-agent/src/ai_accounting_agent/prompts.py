@@ -144,6 +144,65 @@ OrderOrderline_post({order: {id}, product: {id}, count, unitPriceExcludingVatCur
 Ledger_search({dateFrom, dateTo, fields: "postings(account(id,name,number),amount)"})
 ```
 
+### 6. Credit Note (reverse an invoice)
+Use the dedicated tool — do NOT create manual vouchers:
+```
+Invoice_search({customerId, invoiceDateFrom, invoiceDateTo}) → find the invoice
+InvoiceCreateCreditNote_createCreditNote({id: invoice_id, date: "YYYY-MM-DD", comment: "reason"})
+```
+This automatically creates a credit memo that nullifies the original invoice.
+
+### 7. Bank Reconciliation (match CSV to invoices/payments)
+```
+Step 1: Import the bank statement CSV
+  BankStatementImport_importBankStatement({bankId, fileFormat: "DNB_CSV", file: <base64>})
+  OR if statement already imported, search:
+  BankStatement_search({accountId})
+
+Step 2: Register customer invoice payments (incoming)
+  For each "Innbetaling" line in CSV:
+    Invoice_search({customerId, invoiceDateFrom, invoiceDateTo}) → find invoice by number
+    InvoicePayment_payment({id: invoice_id, paymentDate, paymentTypeId, paidAmount: amount_from_CSV})
+  For partial payments: use the exact CSV amount (paidAmount), not the full invoice amount.
+
+Step 3: Register supplier invoice payments (outgoing)
+  For each "Betaling Leverandor" line:
+    Supplier_search({}) → find supplier
+    SupplierInvoice_search({supplierId, invoiceDateFrom, invoiceDateTo}) → find supplier invoice
+    SupplierInvoiceAddPayment_addPayment({invoiceId, paymentType: 0, amount, paymentDate})
+  If supplier invoices don't exist, create them first:
+    IncomingInvoice_post({invoiceDate, dueDate, invoiceNumber, supplierId, amount, ...})
+
+Step 4: Book bank fees/other items
+  LedgerVoucher_post({date, description: "Bankgebyr", postings: [
+    {row: 1, account: {id: <7770_bank_fees>}, amount: fee_amount},
+    {row: 2, account: {id: <1920_bank>}, amount: -fee_amount}
+  ]})
+```
+IMPORTANT: Always use the proper payment tools (InvoicePayment_payment, SupplierInvoiceAddPayment_addPayment) instead of manual vouchers. The scoring system checks that payments are linked to invoices.
+
+### 8. Supplier Invoice Payment
+Do NOT create manual vouchers for supplier payments. Use the proper flow:
+```
+Supplier_search({}) → find supplier ID
+SupplierInvoice_search({supplierId}) → find existing invoice
+SupplierInvoiceAddPayment_addPayment({invoiceId: supplier_invoice_id, paymentType: 0, amount, paymentDate, paidAmountCurrency: amount})
+```
+If no supplier invoice exists and you need to create one:
+```
+IncomingInvoice_post({invoiceDate, dueDate, invoiceNumber, supplierId, amount})
+```
+
+### 9. Currency Invoice with Exchange Rate Differences (Agio/Disagio)
+```
+Customer_search → find customer
+Currency_search({code: "EUR"}) → get currency ID
+Order_post({customer, orderDate, currency: {id}, orderLines: [{...}]})
+Invoice_post({orders: [{id}], invoiceDate, invoiceDueDate, currency: {id}})
+InvoicePayment_payment({id, paymentDate, paymentTypeId, paidAmount: NOK_amount_at_payment_rate, paidAmountCurrency: original_currency_amount})
+→ Tripletex automatically calculates agio/disagio when payment rate differs from invoice rate
+```
+
 ## EFFICIENCY TIPS
 
 1. **Use returned IDs** — After POST, the response contains the new ID. Don't re-fetch with GET.

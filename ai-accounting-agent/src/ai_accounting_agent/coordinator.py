@@ -95,12 +95,40 @@ ESSENTIAL_TOOLS = {
     "Project_post",
     "ProjectParticipant_post",
     "SupplierInvoice_search",
+    "SupplierInvoice_get",
     "SupplierInvoiceAddPayment_addPayment",
+    "SupplierInvoiceApprove_approve",
     "SalaryType_search",
     "SalaryTransaction_post",
     "Division_search",
     "Division_post",
     "LedgerVatType_search",
+    # Credit notes and reversals
+    "InvoiceCreateCreditNote_createCreditNote",
+    "LedgerVoucherReverse_reverse",
+    # Bank reconciliation
+    "BankStatement_search",
+    "BankStatement_get",
+    "BankStatementImport_importBankStatement",
+    "BankStatementTransaction_search",
+    "BankReconciliation_search",
+    "BankReconciliation_post",
+    "BankReconciliation_get",
+    "BankReconciliationMatch_post",
+    "BankReconciliationMatch_search",
+    "BankReconciliationMatchSuggest_suggest",
+    "BankReconciliationPaymentType_search",
+    # Ledger postings and open posts
+    "LedgerPosting_search",
+    "LedgerPostingOpenPost_openPost",
+    "LedgerPaymentTypeOut_search",
+    # Ledger/balance
+    "Ledger_search",
+    "LedgerVoucherType_search",
+    # Activity
+    "Activity_search",
+    "Activity_post",
+    "ProjectProjectActivity_post",
 }
 
 
