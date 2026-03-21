@@ -13,10 +13,16 @@ from dotenv import load_dotenv
 
 from .coordinator import run_accounting_task
 from .file_processor import FileProcessor
-from .tripletex_client import set_tripletex_client, cleanup_tripletex_client
+# TripletexClient is unused - all API calls go through MCP tools
+# Keeping import available for future use if needed
 
 # Load environment variables
 load_dotenv()
+
+# Concurrency guard: serialize /solve requests to prevent credential conflicts
+# The MCP server uses global credentials, so concurrent requests with different
+# credentials would overwrite each other. This lock ensures one task at a time.
+_solve_lock = asyncio.Lock()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -112,6 +118,14 @@ async def solve(request: Request):
     logger.info(f"[{request_id}] 📤 RECEIVED REQUEST FROM COMPETITION")
     logger.info(f"{'=' * 80}")
 
+    # Serialize requests to prevent credential conflicts in the MCP server.
+    # The MCP server uses process-global credentials, so concurrent requests
+    # with different credentials would overwrite each other.
+    if _solve_lock.locked():
+        logger.warning(
+            f"[{request_id}] ⚠ Another /solve request is in progress, waiting for lock..."
+        )
+    await _solve_lock.acquire()
     try:
         # Parse request
         body = await request.json()
@@ -167,7 +181,15 @@ async def solve(request: Request):
                 file_contents = []
                 for pf in file_data["processed_files"]:
                     filename = pf.get("filename", "unknown")
-                    content = pf.get("extracted_text") or pf.get("content", "")
+                    # file_processor returns extracted_data as a nested dict
+                    # with keys like full_text (PDF), text (image OCR), content (text/CSV)
+                    extracted = pf.get("extracted_data", {})
+                    content = (
+                        extracted.get("full_text")  # PDF via pdfplumber/PyPDF2
+                        or extracted.get("text")  # Image via OCR
+                        or extracted.get("content")  # Text/CSV
+                        or ""
+                    )
                     if content:
                         file_contents.append(
                             f"--- FILE: {filename} ---\n{content}\n--- END FILE ---"
@@ -182,16 +204,35 @@ async def solve(request: Request):
                     f"[{request_id}] ⚠ File processing failed or returned no content"
                 )
 
-        # Set up Tripletex client with per-request credentials
+        # Push credentials to MCP server (separate process)
         if base_url and session_token:
-            # Set dynamic credentials for this request
-            set_tripletex_client(base_url, session_token)
-            # Also set environment variables for MCP server if it checks them
-            os.environ["TRIPLETEX_BASE_URL"] = base_url
-            os.environ["TRIPLETEX_SESSION_TOKEN"] = session_token
-            logger.info(
-                f"[{request_id}] ✓ Configured Tripletex client with provided credentials"
-            )
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        "http://localhost:8083/update-credentials",
+                        json={
+                            "base_url": base_url,
+                            "session_token": session_token,
+                        },
+                    )
+                    if resp.status_code == 200:
+                        logger.info(
+                            f"[{request_id}] ✓ Pushed credentials to MCP server"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{request_id}] ⚠ MCP credential update returned {resp.status_code}: {resp.text}"
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"[{request_id}] ⚠ Could not push credentials to MCP server: {e}"
+                )
+                # Fall back to env vars (works if same process)
+                os.environ["TRIPLETEX_BASE_URL"] = base_url
+                os.environ["TRIPLETEX_SESSION_TOKEN"] = session_token
+            logger.info(f"[{request_id}] ✓ Configured credentials for this request")
         else:
             logger.warning(
                 f"[{request_id}] ⚠ Missing Tripletex credentials in request!"
@@ -216,7 +257,6 @@ async def solve(request: Request):
             logger.error(
                 f"[{request_id}] ⏱ TIMEOUT after {task_elapsed:.2f}s - task exceeded 280s limit"
             )
-            await cleanup_tripletex_client()
             logger.info(
                 f"[{request_id}] ✓ Returning HTTP 200 with spec-compliant response"
             )
@@ -227,9 +267,6 @@ async def solve(request: Request):
 
         task_elapsed = asyncio.get_event_loop().time() - task_start
         logger.info(f"[{request_id}] ✓ Task execution completed in {task_elapsed:.2f}s")
-
-        # Clean up client
-        await cleanup_tripletex_client()
 
         # Always return completed per spec
         logger.info(f"[{request_id}] 📥 RESPONSE TO COMPETITION:")
@@ -262,6 +299,9 @@ async def solve(request: Request):
             status_code=200,
             content={"status": "completed"},
         )
+
+    finally:
+        _solve_lock.release()
 
 
 # ============================================================================

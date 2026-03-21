@@ -30,6 +30,25 @@ load_dotenv()
 # ============================================================================
 
 
+# In-process dynamic credentials (updated via /update-credentials HTTP endpoint)
+# This is process-safe: the agent calls the MCP server's HTTP endpoint to update these.
+_dynamic_base_url: Optional[str] = None
+_dynamic_session_token: Optional[str] = None
+
+
+def set_dynamic_credentials(base_url: str, session_token: str):
+    """Update dynamic credentials in this process (called via HTTP endpoint)."""
+    global _dynamic_base_url, _dynamic_session_token
+    _dynamic_base_url = base_url
+    _dynamic_session_token = session_token
+    # Also set env vars so os.getenv fallback works consistently
+    os.environ["TRIPLETEX_BASE_URL"] = base_url
+    os.environ["TRIPLETEX_SESSION_TOKEN"] = session_token
+    logger.info(
+        f"Dynamic credentials updated: base_url={base_url}, token={session_token[:20]}..."
+    )
+
+
 def get_credentials():
     """
     Get Tripletex credentials, preferring dynamic runtime values.
@@ -37,12 +56,19 @@ def get_credentials():
     This is called on EACH request to allow dynamic credential updates.
 
     Priority:
-    1. TRIPLETEX_* env vars (set dynamically per request)
-    2. Static .env values (fallback)
+    1. In-process dynamic credentials (set via /update-credentials endpoint)
+    2. TRIPLETEX_* env vars
+    3. Static .env values (fallback)
     """
-    # Dynamic credentials (set per-request)
-    base_url = os.getenv("TRIPLETEX_BASE_URL")
-    session_token = os.getenv("TRIPLETEX_SESSION_TOKEN")
+    # In-process dynamic credentials (highest priority)
+    base_url = _dynamic_base_url
+    session_token = _dynamic_session_token
+
+    # Fallback to env vars
+    if not base_url:
+        base_url = os.getenv("TRIPLETEX_BASE_URL")
+    if not session_token:
+        session_token = os.getenv("TRIPLETEX_SESSION_TOKEN")
 
     # Fallback to static credentials
     if not base_url:
@@ -276,8 +302,38 @@ def create_mcp_server():
 
 try:
     mcp = create_mcp_server()
+
+    # Add custom HTTP endpoints for credential management and health checks
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse as StarletteJSONResponse
+
+    @mcp.custom_route("/update-credentials", methods=["POST"])
+    async def update_credentials(request: Request) -> StarletteJSONResponse:
+        """Update Tripletex credentials dynamically (called by agent per-request)."""
+        try:
+            body = await request.json()
+            base_url = body.get("base_url", "")
+            session_token = body.get("session_token", "")
+            if not base_url or not session_token:
+                return StarletteJSONResponse(
+                    {"error": "base_url and session_token required"}, status_code=400
+                )
+            set_dynamic_credentials(base_url, session_token)
+            return StarletteJSONResponse({"status": "updated"})
+        except Exception as e:
+            logger.error(f"Failed to update credentials: {e}")
+            return StarletteJSONResponse({"error": str(e)}, status_code=500)
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def mcp_health(request: Request) -> StarletteJSONResponse:
+        """Health check for MCP server."""
+        return StarletteJSONResponse(
+            {"status": "healthy", "service": "ai-accountant-mcp", "version": "0.1.0"}
+        )
+
     logger.info("")
     logger.info("✓ MCP server initialized successfully")
+    logger.info("✓ Custom routes: /update-credentials (POST), /health (GET)")
     logger.info("")
 except Exception as e:
     logger.error("")
