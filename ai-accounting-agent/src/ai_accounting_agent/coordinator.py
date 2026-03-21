@@ -1,20 +1,97 @@
-"""Coordinator for accounting task execution with sub-agents."""
+"""Coordinator for accounting task execution with sub-agents.
+
+This module provides direct integration with pydantic-ai and MCP toolsets
+without relying on machine-core or model-providers packages.
+"""
 
 import json
-import asyncio
+import os
 from typing import Dict, List, Any, Optional
+
 from loguru import logger
-from machine_core.core.agent_base import BaseAgent
+from pydantic_ai import Agent
+from pydantic_ai.mcp import MCPServerStreamableHTTP
+
+from .llm import get_google_model
+from .embeddings import get_embedding_provider
 from .prompts import (
     ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
     ACCOUNTING_SUBAGENT_PROMPT_TEMPLATE,
     ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
     ACCOUNTING_COORDINATOR_PROMPT_TEMPLATE,
 )
-import os
 
 
-class AccountingSubAgent(BaseAgent):
+def load_mcp_config(config_path: str = "mcp_accountant.json") -> List[Dict[str, Any]]:
+    """Load MCP server configurations from a JSON file.
+
+    Args:
+        config_path: Path to the MCP config file
+
+    Returns:
+        List of server configurations
+    """
+    try:
+        with open(config_path, "r") as f:
+            config_data = json.load(f)
+
+        servers = []
+        mcp_servers = config_data.get("servers", {})
+
+        for server_name, server_config in mcp_servers.items():
+            servers.append(
+                {
+                    "name": server_name,
+                    "type": server_config.get("type", "http"),
+                    "url": server_config.get("url", ""),
+                }
+            )
+
+        logger.info(f"Loaded {len(servers)} MCP server(s) from {config_path}")
+        return servers
+
+    except Exception as e:
+        logger.error(f"Failed to load MCP config from {config_path}: {e}")
+        return []
+
+
+def setup_mcp_toolsets(
+    server_configs: List[Dict[str, Any]],
+    timeout: float = 300.0,
+) -> List[MCPServerStreamableHTTP]:
+    """Set up MCP toolsets from server configurations.
+
+    Args:
+        server_configs: List of server configurations
+        timeout: Timeout for MCP connections in seconds
+
+    Returns:
+        List of configured MCP toolsets
+    """
+    toolsets = []
+
+    for config in server_configs:
+        try:
+            server_type = config.get("type", "http")
+            url = config.get("url", "")
+
+            if server_type in ("http", "sse"):
+                server = MCPServerStreamableHTTP(
+                    url=url,
+                    timeout=timeout,
+                )
+                toolsets.append(server)
+                logger.info(f"Added {server_type} MCP server: {url}")
+            else:
+                logger.warning(f"Unknown server type: {server_type}")
+
+        except Exception as e:
+            logger.error(f"Failed to setup MCP server {config}: {e}")
+
+    return toolsets
+
+
+class AccountingSubAgent:
     """Sub-agent that executes a specific accounting subtask with RAG filtering."""
 
     def __init__(
@@ -23,10 +100,9 @@ class AccountingSubAgent(BaseAgent):
         subtask_title: str,
         subtask_description: str,
         main_task: str,
-        tripletex_credentials: Dict[str, Any] = None,
+        tripletex_credentials: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Initialize a sub-agent for a specific accounting subtask.
+        """Initialize a sub-agent for a specific accounting subtask.
 
         Args:
             subtask_id: Unique identifier for the subtask
@@ -35,14 +111,20 @@ class AccountingSubAgent(BaseAgent):
             main_task: The overall accounting task
             tripletex_credentials: Tripletex API credentials (base_url, session_token)
         """
+        self.subtask_id = subtask_id
+        self.subtask_title = subtask_title
+        self.tripletex_credentials = tripletex_credentials or {}
+        self.use_rag_filtering = True
+        self.rag_manager = None
+        self._rag_initialized = False
+
         # Extract credentials for inclusion in prompt
-        # These credentials are used by the TripletexClient for actual API calls
-        base_url = (tripletex_credentials or {}).get(
+        base_url = self.tripletex_credentials.get(
             "base_url", "https://api.tripletex.no/v2"
         )
-        session_token = (tripletex_credentials or {}).get("session_token", "")
+        session_token = self.tripletex_credentials.get("session_token", "")
 
-        prompt = ACCOUNTING_SUBAGENT_PROMPT_TEMPLATE.format(
+        self._user_prompt = ACCOUNTING_SUBAGENT_PROMPT_TEMPLATE.format(
             subtask_id=subtask_id,
             subtask_title=subtask_title,
             subtask_description=subtask_description,
@@ -51,27 +133,32 @@ class AccountingSubAgent(BaseAgent):
             session_token=session_token,
         )
 
-        super().__init__(
-            model_name=os.getenv("LLM_MODEL"),
-            system_prompt=ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
-            mcp_config_path="mcp_accountant.json",
-        )
-        self.subtask_id = subtask_id
-        self.subtask_title = subtask_title
-        self._user_prompt = prompt
-        self.tripletex_credentials = tripletex_credentials or {}
-        self.use_rag_filtering = True  # Enable RAG filtering
-        self.rag_manager = None
-        self._original_toolsets = list(self.toolsets) if self.toolsets else []
-        self._rag_initialized = False
+        # Set up model and toolsets
+        self.model = get_google_model()
 
-    async def run(self, task: str = None) -> str:
-        """Required abstract method implementation."""
+        # Load MCP config and create toolsets
+        server_configs = load_mcp_config()
+        self.toolsets = setup_mcp_toolsets(server_configs)
+        self._original_toolsets = list(self.toolsets)
+
+        # Create agent
+        self.agent = Agent(
+            model=self.model,
+            toolsets=self.toolsets,
+            system_prompt=ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
+            retries=3,
+        )
+
+        logger.info(
+            f"SubAgent {subtask_id} initialized with {len(self.toolsets)} toolset(s)"
+        )
+
+    async def run(self, task: str = "") -> str:
+        """Required method for running the agent."""
         return await self.execute()
 
     async def execute(self) -> str:
-        """
-        Execute this subtask using MCP tools with RAG filtering.
+        """Execute this subtask using MCP tools with RAG filtering.
 
         Returns:
             Report of what was executed
@@ -83,13 +170,13 @@ class AccountingSubAgent(BaseAgent):
             if self.use_rag_filtering and not self._rag_initialized:
                 await self._initialize_rag_filtering()
 
-            result = await self.run_query(self._user_prompt)
+            result = await self.agent.run(self._user_prompt)
 
             # Extract the report
             if hasattr(result, "data"):
-                report = result.data
+                report = getattr(result, "data")
             elif hasattr(result, "output"):
-                report = result.output
+                report = getattr(result, "output")
             else:
                 report = str(result)
 
@@ -108,12 +195,13 @@ class AccountingSubAgent(BaseAgent):
             )
 
             from .rag_tool_manager import create_rag_tool_manager
-            from model_providers.embeddings import get_embedding_provider
 
             # Get embedding provider
             try:
                 embedding_provider = get_embedding_provider()
-                logger.debug(f"SubAgent {self.subtask_id}: Using embedding provider")
+                logger.debug(
+                    f"SubAgent {self.subtask_id}: Using Google embedding provider"
+                )
             except Exception as e:
                 logger.warning(
                     f"SubAgent {self.subtask_id}: Could not load embedding provider: {e}"
@@ -123,7 +211,7 @@ class AccountingSubAgent(BaseAgent):
             # Create RAG manager
             self.rag_manager = create_rag_tool_manager(
                 embedding_provider=embedding_provider,
-                top_k=300,
+                top_k=100,
             )
 
             # Initialize RAG manager
@@ -134,7 +222,7 @@ class AccountingSubAgent(BaseAgent):
                 logger.debug(
                     f"SubAgent {self.subtask_id}: Indexing {len(self._original_toolsets)} toolset(s)..."
                 )
-                await self.rag_manager.index_toolsets(self._original_toolsets)
+                await self.rag_manager.index_toolsets(self._original_toolsets)  # type: ignore
 
                 stats = self.rag_manager.get_statistics()
                 logger.info(
@@ -146,17 +234,15 @@ class AccountingSubAgent(BaseAgent):
             if self._original_toolsets and self.rag_manager:
                 filtered_toolsets = await self.rag_manager.create_filtered_toolsets(
                     self._original_toolsets, self.subtask_title[:100]
-                )
+                )  # type: ignore
                 self.toolsets = filtered_toolsets
 
                 # Recreate agent with filtered toolsets
-                from pydantic_ai import Agent
-
                 self.agent = Agent(
                     model=self.model,
                     toolsets=filtered_toolsets,
                     system_prompt=ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
-                    retries=self.agent_config.max_tool_retries,
+                    retries=3,
                 )
 
                 logger.info(
@@ -175,7 +261,7 @@ class AccountingSubAgent(BaseAgent):
             return False
 
 
-class CoordinatorAgent(BaseAgent):
+class CoordinatorAgent:
     """Coordinator agent that orchestrates accounting sub-agents."""
 
     def __init__(
@@ -185,11 +271,10 @@ class CoordinatorAgent(BaseAgent):
         complexity: str,
         subtasks: List[Dict[str, Any]],
         base_url: str = "http://localhost:8083",
-        tripletex_credentials: Dict[str, Any] = None,
+        tripletex_credentials: Optional[Dict[str, Any]] = None,
         use_rag_filtering: bool = True,
     ):
-        """
-        Initialize the coordinator agent.
+        """Initialize the coordinator agent.
 
         Args:
             task_summary: Summary of the accounting task
@@ -200,33 +285,40 @@ class CoordinatorAgent(BaseAgent):
             tripletex_credentials: Tripletex API credentials (base_url, session_token)
             use_rag_filtering: Whether to use RAG filtering for tool reduction
         """
-        subtasks_json = json.dumps(subtasks, indent=2, ensure_ascii=False)
-
         self.task_summary = task_summary
         self.task_type = task_type
         self.complexity = complexity
         self.subtasks = subtasks
         self.base_url = base_url
         self.tripletex_credentials = tripletex_credentials or {}
-
-        super().__init__(
-            model_name=os.getenv("LLM_MODEL"),
-            system_prompt=ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
-            mcp_config_path="mcp_accountant.json",
-        )
-
         self.use_rag_filtering = use_rag_filtering
         self.rag_manager = None
-        self._original_toolsets = list(self.toolsets) if self.toolsets else []
         self._rag_initialized = False
 
-    async def run(self, query: str = None) -> str:
-        """Required abstract method implementation."""
+        # Set up model and toolsets
+        self.model = get_google_model()
+
+        # Load MCP config and create toolsets
+        server_configs = load_mcp_config()
+        self.toolsets = setup_mcp_toolsets(server_configs)
+        self._original_toolsets = list(self.toolsets)
+
+        # Create agent
+        self.agent = Agent(
+            model=self.model,
+            toolsets=self.toolsets,
+            system_prompt=ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
+            retries=3,
+        )
+
+        logger.info(f"Coordinator initialized with {len(self.toolsets)} toolset(s)")
+
+    async def run(self, query: str = "") -> str:
+        """Required method for running the agent."""
         return await self.coordinate_execution()
 
     async def coordinate_execution(self) -> str:
-        """
-        Execute the accounting task directly with RAG filtering.
+        """Execute the accounting task directly with RAG filtering.
 
         Returns:
             Summary of execution results
@@ -239,7 +331,6 @@ class CoordinatorAgent(BaseAgent):
                 await self._initialize_rag_filtering()
 
             # Create the prompt for execution with credentials
-            # Credentials are set in the TripletexClient and environment for MCP
             base_url = self.tripletex_credentials.get(
                 "base_url", "https://api.tripletex.no/v2"
             )
@@ -253,13 +344,13 @@ class CoordinatorAgent(BaseAgent):
 
             # Execute task directly using the coordinator's tools (now RAG-filtered)
             logger.info("Executing task with RAG-filtered tools")
-            result = await self.run_query(execution_prompt)
+            result = await self.agent.run(execution_prompt)
 
             # Extract result
             if hasattr(result, "data"):
-                report = result.data
+                report = getattr(result, "data")
             elif hasattr(result, "output"):
-                report = result.output
+                report = getattr(result, "output")
             else:
                 report = str(result)
 
@@ -277,7 +368,7 @@ Completed
 """
 
         except Exception as e:
-            logger.error(f"Coordinator error: {e}")
+            logger.error(f"Coordinator error: {e}", exc_info=True)
             raise
 
     async def _initialize_rag_filtering(self):
@@ -286,12 +377,11 @@ Completed
             logger.info("Coordinator: Initializing RAG tool filtering...")
 
             from .rag_tool_manager import create_rag_tool_manager
-            from model_providers.embeddings import get_embedding_provider
 
             # Get embedding provider
             try:
                 embedding_provider = get_embedding_provider()
-                logger.debug("Coordinator: Using embedding provider")
+                logger.debug("Coordinator: Using Google embedding provider")
             except Exception as e:
                 logger.warning(f"Coordinator: Could not load embedding provider: {e}")
                 embedding_provider = None
@@ -299,7 +389,7 @@ Completed
             # Create RAG manager
             self.rag_manager = create_rag_tool_manager(
                 embedding_provider=embedding_provider,
-                top_k=300,  # Return top tools for filtering
+                top_k=100,
             )
 
             # Initialize RAG manager
@@ -310,7 +400,7 @@ Completed
                 logger.debug(
                     f"Coordinator: Indexing {len(self._original_toolsets)} toolset(s)..."
                 )
-                await self.rag_manager.index_toolsets(self._original_toolsets)
+                await self.rag_manager.index_toolsets(self._original_toolsets)  # type: ignore
 
                 stats = self.rag_manager.get_statistics()
                 logger.info(
@@ -321,17 +411,15 @@ Completed
             if self._original_toolsets and self.rag_manager:
                 filtered_toolsets = await self.rag_manager.create_filtered_toolsets(
                     self._original_toolsets, self.task_summary[:200]
-                )
+                )  # type: ignore
                 self.toolsets = filtered_toolsets
 
                 # Recreate agent with filtered toolsets
-                from pydantic_ai import Agent
-
                 self.agent = Agent(
                     model=self.model,
                     toolsets=filtered_toolsets,
                     system_prompt=ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
-                    retries=self.agent_config.max_tool_retries,
+                    retries=3,
                 )
 
                 logger.info(
@@ -350,10 +438,9 @@ Completed
 async def run_accounting_task(
     prompt: str,
     file_content: str = "",
-    tripletex_credentials: dict = None,
+    tripletex_credentials: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Run the accounting task workflow - simplified direct execution.
+    """Run the accounting task workflow - simplified direct execution.
 
     This function executes tasks directly without planning/splitting overhead:
     - Single main agent takes the original prompt
@@ -412,5 +499,5 @@ Use the information from the attached files above to complete the task."""
         }
 
     except Exception as e:
-        logger.error(f"Accounting task workflow failed: {e}")
+        logger.error(f"Accounting task workflow failed: {e}", exc_info=True)
         return {"success": False, "status": "failed", "error": str(e)}

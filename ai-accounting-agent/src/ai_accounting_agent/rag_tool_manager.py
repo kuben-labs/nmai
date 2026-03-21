@@ -163,7 +163,7 @@ class RAGToolManager:
         return filtered_tools
 
     async def create_filtered_toolsets(
-        self, toolsets: List[AbstractToolset[Any]], task_prompt: str
+        self, toolsets: List[Any], task_prompt: str
     ) -> List[RAGToolFilter]:
         """Create filtered versions of toolsets for a specific task.
 

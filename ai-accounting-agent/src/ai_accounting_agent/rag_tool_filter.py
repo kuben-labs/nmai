@@ -42,11 +42,11 @@ class ToolEmbedder:
         """Initialize the tool embedder.
 
         Args:
-            embedding_provider: Optional embedding provider (ResolvedEmbedding from model_providers).
+            embedding_provider: Optional embedding provider (GoogleEmbeddingProvider).
                                If None, will try to get from environment.
         """
         self.embedding_provider = embedding_provider
-        # If embedding_provider is a ResolvedEmbedding, extract the actual provider
+        # If embedding_provider has a provider attribute, extract the actual provider
         if embedding_provider and hasattr(embedding_provider, "provider"):
             self.provider = embedding_provider.provider
         else:
@@ -327,7 +327,7 @@ class RAGToolFilter(AbstractToolset):
 
     def __init__(
         self,
-        wrapped_toolset: AbstractToolset,
+        wrapped_toolset: Any,
         vector_store: ToolVectorStore,
         embedder: ToolEmbedder,
         task_prompt: str,
@@ -425,6 +425,46 @@ class RAGToolFilter(AbstractToolset):
             # CRITICAL: Replace huge parameter schemas with minimal valid schemas
             # This reduces token usage while keeping tools functional
             simplified_tools = {}
+
+            def sanitize_schema(schema, depth=0):
+                """Recursively sanitize schema to avoid $ref and excessive depth."""
+                if not isinstance(schema, dict):
+                    return schema
+
+                # Strip $defs completely to avoid pydantic-ai parsing issues with them
+                if depth == 0 and "$defs" in schema:
+                    schema = dict(schema)
+                    del schema["$defs"]
+
+                # If this is a reference, replace it with a generic object
+                if "$ref" in schema:
+                    return {"type": "object", "description": "Complex object"}
+
+                # If we're too deep, and this looks like a schema object, replace it
+                if depth > 2 and schema.get("type") in ("object", "array"):
+                    if schema.get("type") == "array":
+                        return {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "description": "Complex object",
+                            },
+                        }
+                    return {"type": "object", "description": "Complex object"}
+
+                sanitized = {}
+                for k, v in schema.items():
+                    if isinstance(v, dict):
+                        sanitized[k] = sanitize_schema(v, depth + 1)
+                    elif isinstance(v, list):
+                        sanitized[k] = [
+                            sanitize_schema(i, depth + 1) if isinstance(i, dict) else i
+                            for i in v
+                        ]
+                    else:
+                        sanitized[k] = v
+                return sanitized
+
             for name, tool in filtered_tools.items():
                 try:
                     # Replace the tool_def's parameters_json_schema with a minimal but valid schema
@@ -432,32 +472,9 @@ class RAGToolFilter(AbstractToolset):
                     if hasattr(tool, "tool_def") and hasattr(
                         tool.tool_def, "parameters_json_schema"
                     ):
-                        # Keep the original to extract required fields
                         original_schema = tool.tool_def.parameters_json_schema or {}
-
-                        # Create minimal schema with just required properties
-                        required_fields = original_schema.get("required", [])
-                        properties = {}
-
-                        # Add minimal definitions for required fields
-                        for field in required_fields:
-                            properties[field] = {
-                                "type": "string",
-                                "description": f"Required parameter: {field}",
-                            }
-
-                        # Create new minimal schema
-                        minimal_schema = {
-                            "type": "object",
-                            "properties": properties,
-                            "additionalProperties": True,  # Allow other fields
-                        }
-
-                        if required_fields:
-                            minimal_schema["required"] = required_fields
-
-                        # Update the tool definition with minimal schema
-                        tool.tool_def.parameters_json_schema = minimal_schema
+                        sanitized_schema = sanitize_schema(original_schema)
+                        tool.tool_def.parameters_json_schema = sanitized_schema
 
                     simplified_tools[name] = tool
                 except Exception as e:
@@ -489,7 +506,7 @@ class RAGToolFilter(AbstractToolset):
         """
         try:
             # Get all tools from wrapped toolset
-            all_tools = await self.wrapped_toolset.list_tools()
+            all_tools = await self.wrapped_toolset.list_tools()  # type: ignore
             logger.info(
                 f"RAGToolFilter.list_tools(): Received {len(all_tools)} tools from wrapped toolset"
             )
@@ -506,36 +523,60 @@ class RAGToolFilter(AbstractToolset):
             # CRITICAL: Replace huge parameter schemas with minimal valid schemas
             # This reduces token usage while keeping tools functional
             simplified_tools = []
+
+            def sanitize_schema(schema, depth=0):
+                """Recursively sanitize schema to avoid $ref and excessive depth."""
+                if not isinstance(schema, dict):
+                    return schema
+
+                # Strip $defs completely to avoid pydantic-ai parsing issues with them
+                if depth == 0 and "$defs" in schema:
+                    schema = dict(schema)
+                    del schema["$defs"]
+
+                # If this is a reference, replace it with a generic object
+                if "$ref" in schema:
+                    return {"type": "object", "description": "Complex object"}
+
+                # If we're too deep, and this looks like a schema object, replace it
+                if depth > 2 and schema.get("type") in ("object", "array"):
+                    if schema.get("type") == "array":
+                        return {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "description": "Complex object",
+                            },
+                        }
+                    return {"type": "object", "description": "Complex object"}
+
+                sanitized = {}
+                for k, v in schema.items():
+                    if isinstance(v, dict):
+                        sanitized[k] = sanitize_schema(v, depth + 1)
+                    elif isinstance(v, list):
+                        sanitized[k] = [
+                            sanitize_schema(i, depth + 1) if isinstance(i, dict) else i
+                            for i in v
+                        ]
+                    else:
+                        sanitized[k] = v
+                return sanitized
+
             for tool in filtered_tools:
                 try:
                     # Create a new ToolDefinition with minimal schema
                     if isinstance(tool, ToolDefinition):
                         # Extract required fields from original schema
                         original_schema = tool.parameters_json_schema or {}
-                        required_fields = original_schema.get("required", [])
 
-                        # Create minimal schema with just required properties
-                        properties = {}
-                        for field in required_fields:
-                            properties[field] = {
-                                "type": "string",
-                                "description": f"Required parameter: {field}",
-                            }
+                        sanitized_schema = sanitize_schema(original_schema)
 
-                        minimal_schema = {
-                            "type": "object",
-                            "properties": properties,
-                            "additionalProperties": True,
-                        }
-
-                        if required_fields:
-                            minimal_schema["required"] = required_fields
-
-                        # Create new ToolDefinition with minimal schema
+                        # Create new ToolDefinition with sanitized schema
                         simplified_tool = ToolDefinition(
                             name=tool.name,
                             description=tool.description,
-                            parameters_json_schema=minimal_schema,
+                            parameters_json_schema=sanitized_schema,
                         )
                         simplified_tools.append(simplified_tool)
                     else:
@@ -601,7 +642,7 @@ class RAGToolFilter(AbstractToolset):
 
 
 async def index_mcp_tools(
-    toolsets: List[AbstractToolset[Any]],
+    toolsets: List[Any],
     vector_store: ToolVectorStore,
     embedder: ToolEmbedder,
 ) -> None:
@@ -620,7 +661,7 @@ async def index_mcp_tools(
     for toolset in toolsets:
         try:
             # Use list_tools() to get all tools from the toolset (it's async)
-            tools_list = await toolset.list_tools()
+            tools_list = await toolset.list_tools()  # type: ignore
             logger.info(
                 f"Extracted {len(tools_list)} tools from {toolset.__class__.__name__}"
             )
@@ -658,7 +699,7 @@ async def index_mcp_tools(
 
 
 async def create_filtered_toolsets(
-    toolsets: List[AbstractToolset],
+    toolsets: List[Any],
     vector_store: ToolVectorStore,
     embedder: ToolEmbedder,
     task_prompt: str,
