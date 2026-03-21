@@ -16,24 +16,6 @@ class TripletexClient:
             auth=self.auth,
             headers={"Content-Type": "application/json"},
         )
-        self._exempt_vat_type_id = None
-
-    def _get_exempt_vat_type_id(self) -> int | None:
-        """Find the exempt (0%) VAT type ID, cached after first lookup."""
-        if self._exempt_vat_type_id is not None:
-            return self._exempt_vat_type_id
-        result = self.get("/ledger/vatType", {"fields": "id,name,number,percentage", "count": 100})
-        if result["status_code"] == 200:
-            values = result["body"].get("values", [])
-            for vt in values:
-                pct = vt.get("percentage")
-                if pct is not None and float(pct) == 0.0:
-                    self._exempt_vat_type_id = vt["id"]
-                    logger.info(f"Found exempt VAT type: id={vt['id']}, name={vt.get('name')}")
-                    return self._exempt_vat_type_id
-        logger.warning("Could not find exempt (0%) VAT type")
-        return None
-
     def _fix_voucher_postings(self, data: dict | None) -> dict | None:
         """Fix voucher postings: set row starting from 1, remove vatType to let account defaults apply."""
         if not data or "postings" not in data:

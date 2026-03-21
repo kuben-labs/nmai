@@ -292,9 +292,15 @@ def run_agent(prompt: str, files: list, base_url: str, session_token: str) -> di
     finally:
         tripletex.close()
 
-    # Determine success: no write-call errors (4xx on POST/PUT/DELETE)
+    # Determine success: check if last write calls succeeded (recovered from earlier errors)
     write_errors = [e for e in errors if e["tool"] != "tripletex_get"]
-    has_errors = len(write_errors) > 0
+    write_calls = [c for c in api_calls if c["tool"] != "tripletex_get"]
+    # Task is FAILED only if it never completed a successful write, or the last write call failed
+    if write_calls:
+        last_write = write_calls[-1]
+        has_errors = last_write["status_code"] >= 400
+    else:
+        has_errors = len(write_errors) > 0
 
     # Log structured task summary for easy querying
     summary = {

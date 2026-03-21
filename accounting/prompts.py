@@ -102,6 +102,7 @@ GET /invoice REQUIRES `invoiceDateFrom` and `invoiceDateTo` query params. Use a 
 Required for POST: `invoiceDate` (YYYY-MM-DD), `invoiceDueDate` (YYYY-MM-DD), `orders` (array of objects with id)
 The invoice is created FROM orders. Create the order with order lines first.
 Optional: `customer` (auto-derived from order), `invoiceComment`, `comment`, `kid` (payment reference)
+NOTE: Invoice does NOT have `sendToCustomer`, `send`, `isSent` fields. To "send" an invoice, just create it — sending is controlled by the customer's `invoiceSendMethod` setting.
 
 ### Payment: PUT /invoice/{id}/:payment
 This is a PUT with QUERY PARAMETERS (not request body):
@@ -123,7 +124,12 @@ Use endpoint like: "/invoice/123/:createCreditNote?date=2026-03-21" with empty d
 
 ### Travel Expense: POST /travelExpense, GET /travelExpense, DELETE /travelExpense/{id}
 Required: `employee` (object with id), `title` (string), `date` (YYYY-MM-DD)
-Optional: `project` (object with id), `department` (object with id), `perDiemCompensations` (array), `mileageAllowances` (array), `costs` (array)
+Optional: `project` (object with id), `department` (object with id), `perDiemCompensations` (array), `mileageAllowances` (array), `costs` (array), `travelDetails` (object)
+CRITICAL: The `type` field determines if this is a "reiseregning" (travel report) or "ansattutlegg" (employee expense). Per diem compensation ONLY works on travel reports, NOT employee expenses. To create a proper travel report, you MUST include `travelDetails`:
+```json
+{"travelDetails": {"departureDate": "2026-03-01", "returnDate": "2026-03-05", "departureFrom": "Oslo", "destination": "Tromsø", "purpose": "Client visit"}}
+```
+If you omit `travelDetails`, the system may create an employee expense instead, and per diem will fail with "Kun reiseregning, ikke ansattutlegg".
 
 ### Travel Expense Cost: POST /travelExpense/cost
 Required: `travelExpense` (object with id), `date` (YYYY-MM-DD)
@@ -139,8 +145,10 @@ NOTE: Does NOT have a `name` field — use `description` or `displayName`. Query
 
 ### Per Diem Compensation: POST /travelExpense/perDiemCompensation
 Required: `travelExpense` (object with id), `location` (string, e.g. "Trondheim, Norge")
-Optional: `count` (integer — number of days), `rate` (number — daily rate NOK), `overnightAccommodation` (string: "NONE", "HOTEL", "BOARDING_HOUSE_WITHOUT_COOKING", "BOARDING_HOUSE_WITH_COOKING"), `isDeductionForBreakfast` (boolean), `isDeductionForLunch` (boolean), `isDeductionForDinner` (boolean), `countryCode` (string, e.g. "NO"), `rateCategory` (object with id), `rateType` (object with id)
+Optional: `count` (integer — number of days), `rate` (number — daily rate NOK), `overnightAccommodation` (string: "NONE", "HOTEL", "BOARDING_HOUSE_WITHOUT_COOKING", "BOARDING_HOUSE_WITH_COOKING"), `isDeductionForBreakfast` (boolean), `isDeductionForLunch` (boolean), `isDeductionForDinner` (boolean), `countryCode` (string, e.g. "NO"), `rateCategory` (object with id), `rateType` (object with id), `travelExpenseZoneId` (integer — optional, overrides zone from location)
 NOTE: Does NOT have `startDate`, `endDate`, `dailyRate`, `nights`, `rateDate`, `countHours`, `numberOfDays` — these field names do NOT exist.
+IMPORTANT: The linked travelExpense MUST be a travel report (reiseregning), NOT an employee expense (ansattutlegg). If you get "Kun reiseregning, ikke ansattutlegg", recreate the travel expense WITH `travelDetails`.
+IMPORTANT: If you get "Country not enabled for travel expense", first GET /travelExpense/zone?isDisabled=false&fields=id,zoneName,countryCode&count=100 to find enabled zones/countries, then use an enabled zone's countryCode or pass `travelExpenseZoneId`.
 
 ### Project: POST /project, GET /project, GET /project/{id}, PUT /project/{id}
 Required: `name`, `projectManager` (object with id — must be an employee), `startDate` (YYYY-MM-DD)
@@ -205,10 +213,17 @@ Required for POST: `name`, `activityType` (REQUIRED — valid values: "GENERAL_A
 NOTE: "PROJECT_SPECIFIC_ACTIVITY" type CANNOT be created via /activity — use /project/projectActivity instead.
 Optional: `number` (string), `description`, `isChargeable` (boolean), `rate` (number)
 
+### Timesheet Entry: POST /timesheet/entry, GET /timesheet/entry, PUT /timesheet/entry/{id}
+Required for POST: `employee` (object with id), `activity` (object with id), `date` (YYYY-MM-DD), `hours` (number)
+Optional: `project` (object with id), `comment` (string), `chargeable` (boolean), `hourlyRate` (number)
+GET REQUIRES `dateFrom` and `dateTo` query params (both mandatory). Use a wide range like `dateFrom=2020-01-01&dateTo=2030-12-31`.
+NOTE: To log hours on a project activity, you need both `activity` (the activity id) and `project` (the project id) on the timesheet entry.
+
 ### Project Activity: POST /project/projectActivity, GET /project/projectActivity
 Links an Activity to a Project. Required for POST: `activity` (object with id), `project` (object with id)
 Optional: `startDate`, `endDate`, `budgetHours`, `budgetHourlyRateCurrency`, `budgetFeeCurrency`
 NOTE: ProjectActivity does NOT have a `name` field — the name comes from the linked Activity.
+GET /project/projectActivity REQUIRES `projectId` query param. Example: `?projectId=123&fields=id,activity&count=100`
 To create a project-specific activity: first POST /activity to create the activity, then POST /project/projectActivity to link it to a project.
 
 ### Custom Accounting Dimensions: POST /ledger/accountingDimensionName, GET /ledger/accountingDimensionName
@@ -276,11 +291,13 @@ When updating entities with PUT, you MUST include the current `id` and `version`
 - "avdelingsleder" / "department leader" → template=DEPARTMENT_LEADER
 
 **Create invoice with items:**
-1. POST /customer (if needed) → customer_id
-2. POST /product (if needed, for each product) → product_ids
-3. GET /ledger/vatType?fields=id,name,percentage&count=100 → find correct VAT type
-4. POST /order with customer, dates, and orderLines inline → order_id
-5. POST /invoice with invoiceDate, invoiceDueDate, orders: [{id: order_id}]
+1. Ensure company has a bank account: GET /ledger/account?isBankAccount=true&fields=id,number,name,bankAccountNumber&count=10. If bankAccountNumber is empty, PUT /ledger/account/{id} with a valid 11-digit Norwegian bank account (use "12345678903"). Include id, version, name from the GET.
+2. POST /customer (if needed) → customer_id
+3. POST /product (if needed, for each product) → product_ids
+4. GET /ledger/vatType?fields=id,name,percentage&count=100 → find correct VAT type
+5. POST /order with customer, dates, and orderLines inline → order_id
+6. POST /invoice with invoiceDate, invoiceDueDate, orders: [{id: order_id}]
+NOTE: If POST /invoice fails with "Faktura kan ikke opprettes før selskapet har registrert et bankkontonummer", do step 1 first.
 
 **Register payment on invoice:**
 1. GET /invoice?fields=id,amount,invoiceNumber&count=100 → find invoice
@@ -306,11 +323,19 @@ When updating entities with PUT, you MUST include the current `id` and `version`
 
 **Create travel expense with per diem and costs:**
 1. POST /employee (if needed) → employee_id
-2. POST /travelExpense with employee, title, date → travelExpense_id
+2. POST /travelExpense with employee, title, date, AND travelDetails (departureDate, returnDate, departureFrom, destination, purpose) → travelExpense_id. Including travelDetails is CRITICAL — without it, it may be created as "ansattutlegg" (employee expense) and per diem will fail.
 3. GET /travelExpense/costCategory?fields=id,description&count=100 → find cost categories
 4. GET /travelExpense/paymentType?fields=id,description&count=100 → find payment types
 5. POST /travelExpense/cost for EACH expense (flight, taxi, etc.) with travelExpense, date, costCategory, paymentType, amountCurrencyIncVat, isPaidByEmployee
-6. POST /travelExpense/perDiemCompensation with travelExpense, location (e.g. "Trondheim, Norge"), count (days), overnightAccommodation ("HOTEL" or "NONE")
+6. GET /travelExpense/zone?isDisabled=false&fields=id,zoneName,countryCode&count=100 → find enabled zones
+7. POST /travelExpense/perDiemCompensation with travelExpense, location (e.g. "Trondheim, Norge"), count (days), overnightAccommodation ("HOTEL" or "NONE"), and optionally travelExpenseZoneId from step 6
+
+**Log timesheet hours and create project invoice:**
+1. GET /employee?email=...&fields=id,firstName,lastName → find employee
+2. GET /project?name=...&fields=id,name,customer&count=100 → find project
+3. GET /activity?name=...&fields=id,name&count=100 → find activity (or POST /activity to create)
+4. POST /timesheet/entry with employee, activity, project, date, hours, hourlyRate (one entry per day or total)
+5. Create invoice: POST /customer (if needed), POST /product, POST /order with orderLines, POST /invoice
 
 **Delete travel expense:**
 1. GET /travelExpense?fields=id,title&count=100 → find the travel expense ID
