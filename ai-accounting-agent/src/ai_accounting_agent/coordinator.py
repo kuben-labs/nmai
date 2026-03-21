@@ -8,6 +8,7 @@ Direct OpenAPI tools architecture (no MCP):
 """
 
 import json
+import os
 import traceback
 from typing import Dict, List, Any, Optional, Set
 
@@ -146,9 +147,10 @@ async def _get_rag_manager():
         logger.warning(f"Could not load embedding provider: {e}")
         embedding_provider = None
 
+    top_k = int(os.getenv("TOP_K", "200"))
     _rag_manager = create_rag_tool_manager(
         embedding_provider=embedding_provider,
-        top_k=200,
+        top_k=top_k,
     )
     await _rag_manager.initialize()
     _rag_initialized = True
@@ -182,7 +184,8 @@ async def _get_relevant_tool_names(task_prompt: str, spec: Dict[str, Any]) -> Se
             )
             return ESSENTIAL_TOOLS
 
-    relevant_names = await rag_manager.get_relevant_names(task_prompt, top_k=200)
+    top_k = int(os.getenv("TOP_K", "200"))
+    relevant_names = await rag_manager.get_relevant_names(task_prompt, top_k=top_k)
     relevant_names = relevant_names | ESSENTIAL_TOOLS
 
     logger.info(
