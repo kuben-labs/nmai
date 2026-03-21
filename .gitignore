@@ -1,0 +1,8 @@
+*.pt
+*.zip
+*.npz
+*.npy
+computervision/coco/
+*/.cache/
+*.jpg
+*.jpeg
