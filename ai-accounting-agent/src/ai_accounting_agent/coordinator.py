@@ -1,44 +1,55 @@
-"""Coordinator for accounting task execution with sub-agents.
+"""Coordinator for accounting task execution.
 
-This module provides direct integration with pydantic-ai and MCP toolsets
-without relying on machine-core or model-providers packages.
+Simplified single-agent architecture:
+- One agent with RAG-filtered MCP tools (full schemas preserved)
+- Uses pydantic-ai's native FilteredToolset for tool filtering
+- No sub-agent hierarchy or planning overhead
 """
 
 import json
 import os
-from typing import Dict, List, Any, Optional
+import traceback
+from typing import Dict, List, Any, Optional, Set
 
 from loguru import logger
 from pydantic_ai import Agent
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    RetryPromptPart,
+)
+from pydantic_ai._agent_graph import (
+    CallToolsNode,
+    ModelRequestNode,
+    UserPromptNode,
+)
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.mcp import MCPServerStreamableHTTP
 
 from .llm import get_google_model
 from .embeddings import get_embedding_provider
 from .prompts import (
-    ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
-    ACCOUNTING_SUBAGENT_PROMPT_TEMPLATE,
-    ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
-    ACCOUNTING_COORDINATOR_PROMPT_TEMPLATE,
+    ACCOUNTING_SYSTEM_INSTRUCTIONS,
+    ACCOUNTING_TASK_PROMPT_TEMPLATE,
 )
+from .rag_tool_manager import create_rag_tool_manager
+
+# Module-level cache for the RAG manager (shared across requests)
+_rag_manager = None
+_rag_initialized = False
 
 
 def load_mcp_config(config_path: str = "mcp_accountant.json") -> List[Dict[str, Any]]:
-    """Load MCP server configurations from a JSON file.
-
-    Args:
-        config_path: Path to the MCP config file
-
-    Returns:
-        List of server configurations
-    """
+    """Load MCP server configurations from a JSON file."""
     try:
         with open(config_path, "r") as f:
             config_data = json.load(f)
 
         servers = []
-        mcp_servers = config_data.get("servers", {})
-
-        for server_name, server_config in mcp_servers.items():
+        for server_name, server_config in config_data.get("servers", {}).items():
             servers.append(
                 {
                     "name": server_name,
@@ -55,387 +66,168 @@ def load_mcp_config(config_path: str = "mcp_accountant.json") -> List[Dict[str, 
         return []
 
 
-def setup_mcp_toolsets(
-    server_configs: List[Dict[str, Any]],
-    timeout: float = 300.0,
-    max_retries: int = 30,
-) -> List[MCPServerStreamableHTTP]:
-    """Set up MCP toolsets from server configurations.
+def get_mcp_toolset(timeout: float = 300.0) -> MCPServerStreamableHTTP:
+    """Create the MCP toolset connection.
 
     Args:
-        server_configs: List of server configurations
         timeout: Timeout for MCP connections in seconds
-        max_retries: Maximum number of tool retries
 
     Returns:
-        List of configured MCP toolsets
+        Configured MCP toolset
     """
-    toolsets = []
+    server_configs = load_mcp_config()
+    if not server_configs:
+        raise ValueError("No MCP servers configured")
 
-    for config in server_configs:
-        try:
-            server_type = config.get("type", "http")
-            url = config.get("url", "")
+    config = server_configs[0]  # We only have one MCP server
+    url = config.get("url", "")
 
-            if server_type in ("http", "sse"):
-                server = MCPServerStreamableHTTP(
-                    url=url,
-                    timeout=timeout,
-                    max_retries=max_retries,
-                )
-                toolsets.append(server)
-                logger.info(f"Added {server_type} MCP server: {url}")
+    server = MCPServerStreamableHTTP(
+        url=url,
+        timeout=timeout,
+        max_retries=5,
+    )
+    logger.info(f"MCP toolset configured: {url}")
+    return server
+
+
+async def _get_rag_manager():
+    """Get or create the shared RAG manager (cached across requests)."""
+    global _rag_manager, _rag_initialized
+
+    if _rag_manager is not None and _rag_initialized:
+        return _rag_manager
+
+    logger.info("Initializing shared RAG tool manager...")
+
+    try:
+        embedding_provider = get_embedding_provider()
+        logger.debug("Using Google embedding provider")
+    except Exception as e:
+        logger.warning(f"Could not load embedding provider: {e}")
+        embedding_provider = None
+
+    _rag_manager = create_rag_tool_manager(
+        embedding_provider=embedding_provider,
+        top_k=100,
+    )
+    await _rag_manager.initialize()
+    _rag_initialized = True
+
+    return _rag_manager
+
+
+async def _index_and_get_relevant_tools(
+    mcp_toolset: MCPServerStreamableHTTP,
+    task_prompt: str,
+    top_k: int = 100,
+) -> Set[str]:
+    """Index MCP tools (if needed) and get relevant tool names for a task.
+
+    Args:
+        mcp_toolset: The MCP toolset to index
+        task_prompt: The task prompt to find relevant tools for
+        top_k: Number of relevant tools to return
+
+    Returns:
+        Set of relevant tool names
+    """
+    rag_manager = await _get_rag_manager()
+
+    # Index tools (skips if already indexed)
+    await rag_manager.index_toolsets([mcp_toolset])
+
+    stats = rag_manager.get_statistics()
+    logger.info(f"RAG index: {stats.get('total_tools', 0)} tools indexed")
+
+    # Get relevant tool names
+    relevant_names = await rag_manager.get_relevant_names(task_prompt, top_k=top_k)
+    logger.info(f"RAG filter: {len(relevant_names)} tools relevant for this task")
+
+    return relevant_names
+
+
+def _simplify_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Simplify a JSON schema so Gemini can process it.
+
+    Gemini rejects schemas that are too complex (nested $ref, deep $defs, etc.).
+    This function resolves $ref references inline and limits nesting depth,
+    while preserving top-level property names, types, and descriptions.
+
+    The key improvement over the old sanitize_schema: instead of replacing
+    $ref with "Complex object", we resolve the reference and include the
+    actual property names and types from the referenced definition.
+    """
+    # Extract $defs for inline resolution (check multiple locations)
+    defs = schema.get("$defs", {})
+    if not defs:
+        defs = schema.get("definitions", {})
+
+    def _resolve(s: Any, depth: int = 0, seen: Optional[set] = None) -> Any:
+        if seen is None:
+            seen = set()
+
+        if not isinstance(s, dict):
+            return s
+
+        # Resolve $ref by inlining the referenced definition
+        if "$ref" in s:
+            ref_path = s["$ref"]  # e.g. "#/$defs/SomeType" or "#/definitions/X"
+            ref_name = ref_path.rsplit("/", 1)[-1] if "/" in ref_path else ref_path
+
+            # Prevent infinite recursion on circular refs
+            if ref_name in seen:
+                return {"type": "object"}
+
+            if ref_name in defs:
+                seen = seen | {ref_name}
+                return _resolve(defs[ref_name], depth, seen)
             else:
-                logger.warning(f"Unknown server type: {server_type}")
+                # $ref not found in $defs — remove it and return generic object
+                return {"type": "object"}
 
-        except Exception as e:
-            logger.error(f"Failed to setup MCP server {config}: {e}")
+        # At depth > 3, flatten complex nested types to simple objects
+        if depth > 3:
+            schema_type = s.get("type")
+            if schema_type == "object":
+                return {"type": "object"}
+            elif schema_type == "array":
+                return {"type": "array", "items": {"type": "object"}}
+            # For simple types (string, integer, etc.) keep as-is
+            # But strip any remaining $ref or $defs in the value
+            return {
+                k: v for k, v in s.items() if k not in ("$ref", "$defs", "definitions")
+            }
 
-    return toolsets
-
-
-class AccountingSubAgent:
-    """Sub-agent that executes a specific accounting subtask with RAG filtering."""
-
-    def __init__(
-        self,
-        subtask_id: str,
-        subtask_title: str,
-        subtask_description: str,
-        main_task: str,
-        tripletex_credentials: Optional[Dict[str, Any]] = None,
-    ):
-        """Initialize a sub-agent for a specific accounting subtask.
-
-        Args:
-            subtask_id: Unique identifier for the subtask
-            subtask_title: Title of the subtask
-            subtask_description: Detailed instructions for this subtask
-            main_task: The overall accounting task
-            tripletex_credentials: Tripletex API credentials (base_url, session_token)
-        """
-        self.subtask_id = subtask_id
-        self.subtask_title = subtask_title
-        self.tripletex_credentials = tripletex_credentials or {}
-        self.use_rag_filtering = True
-        self.rag_manager = None
-        self._rag_initialized = False
-
-        # Extract credentials for inclusion in prompt
-        base_url = self.tripletex_credentials.get(
-            "base_url", "https://api.tripletex.no/v2"
-        )
-        session_token = self.tripletex_credentials.get("session_token", "")
-
-        self._user_prompt = ACCOUNTING_SUBAGENT_PROMPT_TEMPLATE.format(
-            subtask_id=subtask_id,
-            subtask_title=subtask_title,
-            subtask_description=subtask_description,
-            main_task=main_task,
-            base_url=base_url,
-            session_token=session_token,
-        )
-
-        # Set up model and toolsets
-        self.model = get_google_model()
-
-        # Load MCP config and create toolsets
-        server_configs = load_mcp_config()
-        self.toolsets = setup_mcp_toolsets(server_configs)
-        self._original_toolsets = list(self.toolsets)
-
-        # Create agent
-        self.agent = Agent(
-            model=self.model,
-            toolsets=self.toolsets,
-            system_prompt=ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
-            retries=30,
-        )
-
-        logger.info(
-            f"SubAgent {subtask_id} initialized with {len(self.toolsets)} toolset(s)"
-        )
-
-    async def run(self, task: str = "") -> str:
-        """Required method for running the agent."""
-        return await self.execute()
-
-    async def execute(self) -> str:
-        """Execute this subtask using MCP tools with RAG filtering.
-
-        Returns:
-            Report of what was executed
-        """
-        logger.info(f"SubAgent {self.subtask_id} executing: {self.subtask_title}")
-
-        try:
-            # Initialize RAG on first execution
-            if self.use_rag_filtering and not self._rag_initialized:
-                await self._initialize_rag_filtering()
-
-            result = await self.agent.run(self._user_prompt)
-
-            # Extract the report
-            if hasattr(result, "data"):
-                report = getattr(result, "data")
-            elif hasattr(result, "output"):
-                report = getattr(result, "output")
+        # Recursively process dict values
+        result = {}
+        for k, v in s.items():
+            if k in ("$defs", "definitions"):
+                continue  # Strip $defs from output (already resolved inline)
+            elif isinstance(v, dict):
+                result[k] = _resolve(v, depth + 1, seen)
+            elif isinstance(v, list):
+                result[k] = [
+                    _resolve(item, depth + 1, seen) if isinstance(item, dict) else item
+                    for item in v
+                ]
             else:
-                report = str(result)
+                result[k] = v
 
-            logger.info(f"SubAgent {self.subtask_id} completed execution")
-            return report
+        return result
 
-        except Exception as e:
-            logger.error(f"SubAgent {self.subtask_id} error: {e}")
-            return f"Error in {self.subtask_id}: {str(e)}"
+    simplified = _resolve(schema)
 
-    async def _initialize_rag_filtering(self):
-        """Initialize RAG filtering for this sub-agent."""
-        try:
-            logger.info(
-                f"SubAgent {self.subtask_id}: Initializing RAG tool filtering..."
-            )
-
-            from .rag_tool_manager import create_rag_tool_manager
-
-            # Get embedding provider
-            try:
-                embedding_provider = get_embedding_provider()
-                logger.debug(
-                    f"SubAgent {self.subtask_id}: Using Google embedding provider"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"SubAgent {self.subtask_id}: Could not load embedding provider: {e}"
-                )
-                embedding_provider = None
-
-            # Create RAG manager
-            self.rag_manager = create_rag_tool_manager(
-                embedding_provider=embedding_provider,
-                top_k=100,
-            )
-
-            # Initialize RAG manager
-            await self.rag_manager.initialize()
-
-            # Index tools from original toolsets
-            if self._original_toolsets:
-                logger.debug(
-                    f"SubAgent {self.subtask_id}: Indexing {len(self._original_toolsets)} toolset(s)..."
-                )
-                await self.rag_manager.index_toolsets(self._original_toolsets)  # type: ignore
-
-                stats = self.rag_manager.get_statistics()
-                logger.info(
-                    f"SubAgent {self.subtask_id}: RAG initialized with {stats.get('total_tools', 0)} tools, "
-                    f"will filter to ~300 most relevant per subtask"
-                )
-
-            # Create filtered toolsets for this subtask
-            if self._original_toolsets and self.rag_manager:
-                filtered_toolsets = await self.rag_manager.create_filtered_toolsets(
-                    self._original_toolsets, self.subtask_title[:100]
-                )  # type: ignore
-                self.toolsets = filtered_toolsets
-
-                # Recreate agent with filtered toolsets
-                self.agent = Agent(
-                    model=self.model,
-                    toolsets=filtered_toolsets,
-                    system_prompt=ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
-                    retries=30,
-                )
-
-                logger.info(
-                    f"SubAgent {self.subtask_id}: Applied RAG filtering with "
-                    f"{len(filtered_toolsets)} filtered toolset(s)"
-                )
-
-            self._rag_initialized = True
-            return True
-
-        except Exception as e:
-            logger.warning(
-                f"SubAgent {self.subtask_id}: RAG filtering initialization failed: {e}"
-            )
-            self.use_rag_filtering = False
-            return False
-
-
-class CoordinatorAgent:
-    """Coordinator agent that orchestrates accounting sub-agents."""
-
-    def __init__(
-        self,
-        task_summary: str,
-        task_type: str,
-        complexity: str,
-        subtasks: List[Dict[str, Any]],
-        base_url: str = "http://localhost:8083",
-        tripletex_credentials: Optional[Dict[str, Any]] = None,
-        use_rag_filtering: bool = True,
-    ):
-        """Initialize the coordinator agent.
-
-        Args:
-            task_summary: Summary of the accounting task
-            task_type: Type of task (e.g., "Tier 1", "Tier 2", "Tier 3")
-            complexity: Task complexity ("simple" or "complex")
-            subtasks: List of subtask dictionaries
-            base_url: Tripletex proxy base URL
-            tripletex_credentials: Tripletex API credentials (base_url, session_token)
-            use_rag_filtering: Whether to use RAG filtering for tool reduction
-        """
-        self.task_summary = task_summary
-        self.task_type = task_type
-        self.complexity = complexity
-        self.subtasks = subtasks
-        self.base_url = base_url
-        self.tripletex_credentials = tripletex_credentials or {}
-        self.use_rag_filtering = use_rag_filtering
-        self.rag_manager = None
-        self._rag_initialized = False
-
-        # Set up model and toolsets
-        self.model = get_google_model()
-
-        # Load MCP config and create toolsets
-        server_configs = load_mcp_config()
-        self.toolsets = setup_mcp_toolsets(server_configs)
-        self._original_toolsets = list(self.toolsets)
-
-        # Create agent
-        self.agent = Agent(
-            model=self.model,
-            toolsets=self.toolsets,
-            system_prompt=ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
-            retries=30,
+    # Final safety pass: ensure absolutely no $ref remains anywhere
+    # (Gemini will reject the entire request if even one $ref is undefined)
+    simplified_str = json.dumps(simplified, default=str)
+    if "$ref" in simplified_str:
+        logger.warning(
+            "Schema still contains $ref after simplification, doing aggressive cleanup"
         )
+        simplified = json.loads(simplified_str.replace('"$ref"', '"_removed_ref"'))
 
-        logger.info(f"Coordinator initialized with {len(self.toolsets)} toolset(s)")
-
-    async def run(self, query: str = "") -> str:
-        """Required method for running the agent."""
-        return await self.coordinate_execution()
-
-    async def coordinate_execution(self) -> str:
-        """Execute the accounting task directly with RAG filtering.
-
-        Returns:
-            Summary of execution results
-        """
-        logger.info(f"Coordinator executing task: {self.task_summary[:100]}")
-
-        try:
-            # Initialize RAG filtering on first execution
-            if self.use_rag_filtering and not self._rag_initialized:
-                await self._initialize_rag_filtering()
-
-            # Create the prompt for execution with credentials
-            base_url = self.tripletex_credentials.get(
-                "base_url", "https://api.tripletex.no/v2"
-            )
-            session_token = self.tripletex_credentials.get("session_token", "")
-
-            execution_prompt = ACCOUNTING_COORDINATOR_PROMPT_TEMPLATE.format(
-                task_description=self.task_summary,
-                base_url=base_url,
-                session_token=session_token,
-            )
-
-            # Execute task directly using the coordinator's tools (now RAG-filtered)
-            logger.info("Executing task with RAG-filtered tools")
-            result = await self.agent.run(execution_prompt)
-
-            # Extract result
-            if hasattr(result, "data"):
-                report = getattr(result, "data")
-            elif hasattr(result, "output"):
-                report = getattr(result, "output")
-            else:
-                report = str(result)
-
-            return f"""
-# Task Execution Report
-
-## Task
-{self.task_summary}
-
-## Result
-{report}
-
-## Status
-Completed
-"""
-
-        except Exception as e:
-            logger.error(f"Coordinator error: {e}", exc_info=True)
-            raise
-
-    async def _initialize_rag_filtering(self):
-        """Initialize RAG filtering for this coordinator execution."""
-        try:
-            logger.info("Coordinator: Initializing RAG tool filtering...")
-
-            from .rag_tool_manager import create_rag_tool_manager
-
-            # Get embedding provider
-            try:
-                embedding_provider = get_embedding_provider()
-                logger.debug("Coordinator: Using Google embedding provider")
-            except Exception as e:
-                logger.warning(f"Coordinator: Could not load embedding provider: {e}")
-                embedding_provider = None
-
-            # Create RAG manager
-            self.rag_manager = create_rag_tool_manager(
-                embedding_provider=embedding_provider,
-                top_k=100,
-            )
-
-            # Initialize RAG manager
-            await self.rag_manager.initialize()
-
-            # Index tools from original toolsets
-            if self._original_toolsets:
-                logger.debug(
-                    f"Coordinator: Indexing {len(self._original_toolsets)} toolset(s)..."
-                )
-                await self.rag_manager.index_toolsets(self._original_toolsets)  # type: ignore
-
-                stats = self.rag_manager.get_statistics()
-                logger.info(
-                    f"Coordinator: RAG initialized with {stats.get('total_tools', 0)} tools"
-                )
-
-            # Create filtered toolsets based on task
-            if self._original_toolsets and self.rag_manager:
-                filtered_toolsets = await self.rag_manager.create_filtered_toolsets(
-                    self._original_toolsets, self.task_summary[:200]
-                )  # type: ignore
-                self.toolsets = filtered_toolsets
-
-                # Recreate agent with filtered toolsets
-                self.agent = Agent(
-                    model=self.model,
-                    toolsets=filtered_toolsets,
-                    system_prompt=ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
-                    retries=30,
-                )
-
-                logger.info(
-                    f"Coordinator: Applied RAG filtering with {len(filtered_toolsets)} filtered toolset(s)"
-                )
-
-            self._rag_initialized = True
-            return True
-
-        except Exception as e:
-            logger.warning(f"Coordinator: RAG filtering initialization failed: {e}")
-            self.use_rag_filtering = False
-            return False
+    return simplified
 
 
 async def run_accounting_task(
@@ -443,64 +235,185 @@ async def run_accounting_task(
     file_content: str = "",
     tripletex_credentials: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run the accounting task workflow - simplified direct execution.
+    """Run the accounting task - single agent with filtered MCP tools.
 
-    This function executes tasks directly without planning/splitting overhead:
-    - Single main agent takes the original prompt
-    - Can spawn 1-2 parallel sub-agents if task requires it
-    - Direct tool invocation in Tripletex
+    This function:
+    1. Creates MCP toolset connection
+    2. Uses RAG to find relevant tools (embedding search)
+    3. Creates a FilteredToolset that preserves full parameter schemas
+    4. Runs a single agent to execute the task
 
     Args:
         prompt: The accounting task prompt
-        file_content: Extracted content from attached files (PDF text, OCR, etc.)
-        tripletex_credentials: Tripletex API credentials (base_url, session_token)
+        file_content: Extracted content from attached files
+        tripletex_credentials: Tripletex API credentials
 
     Returns:
         Dictionary with task results
     """
-    logger.info("Starting simplified accounting task workflow...")
+    logger.info("Starting accounting task execution...")
+    credentials = tripletex_credentials or {}
 
-    try:
-        # Build complete task context including file content
-        full_prompt = prompt
-        if file_content:
-            full_prompt = f"""{prompt}
+    # Build full prompt with file content
+    full_prompt = prompt
+    if file_content:
+        full_prompt = f"""{prompt}
 
 ATTACHED FILE CONTENT:
 {file_content}
 
 Use the information from the attached files above to complete the task."""
-            logger.info(f"Added {len(file_content)} chars of file content to prompt")
+        logger.info(f"Added {len(file_content)} chars of file content to prompt")
 
-        # Single step: Execute the task directly
-        logger.info("Executing task directly with main agent...")
+    # Create MCP toolset
+    mcp_toolset = get_mcp_toolset()
 
-        # Create main agent to execute the task
-        coordinator = CoordinatorAgent(
-            task_summary=full_prompt,
-            task_type="Direct",
-            complexity="single",
-            subtasks=[
-                {
-                    "id": "main",
-                    "title": "Execute Task",
-                    "description": full_prompt,
-                    "dependencies": None,
-                }
-            ],
-            tripletex_credentials=tripletex_credentials or {},
+    try:
+        # Get relevant tool names via RAG search
+        relevant_names = await _index_and_get_relevant_tools(
+            mcp_toolset, full_prompt, top_k=100
         )
 
-        execution_report = await coordinator.coordinate_execution()
+        # Create filtered toolset using pydantic-ai's native FilteredToolset
+        # Then apply schema simplification via prepared() so Gemini can handle it.
+        # This resolves $ref inline (preserving property names/types) instead of
+        # replacing them with "Complex object" like the old approach did.
+        from dataclasses import replace as dc_replace
+        from pydantic_ai._run_context import RunContext as PydanticRunContext
 
-        logger.info("Accounting task workflow completed successfully")
+        async def _simplify_tool_defs(
+            ctx: PydanticRunContext, tool_defs: list[ToolDefinition]
+        ) -> list[ToolDefinition]:
+            simplified = []
+            for td in tool_defs:
+                if td.parameters_json_schema:
+                    new_schema = _simplify_schema_for_gemini(td.parameters_json_schema)
+                    simplified.append(dc_replace(td, parameters_json_schema=new_schema))
+                else:
+                    simplified.append(td)
+            return simplified
+
+        filtered_toolset = mcp_toolset.filtered(
+            lambda ctx, tool_def: tool_def.name in relevant_names
+        ).prepared(_simplify_tool_defs)
+
+        logger.info(
+            f"Created FilteredToolset: {len(relevant_names)} tools "
+            f"(schemas simplified with $ref resolution for Gemini)"
+        )
+
+        # Build the execution prompt with credentials
+        base_url = credentials.get("base_url", "https://api.tripletex.no/v2")
+        session_token = credentials.get("session_token", "")
+
+        execution_prompt = ACCOUNTING_TASK_PROMPT_TEMPLATE.format(
+            task_description=full_prompt,
+            base_url=base_url,
+            session_token=session_token,
+        )
+
+        # Create and run the agent
+        model = get_google_model()
+        agent = Agent(
+            model=model,
+            toolsets=[filtered_toolset],
+            system_prompt=ACCOUNTING_SYSTEM_INSTRUCTIONS,
+            retries=30,
+        )
+
+        logger.info("Executing task with agent (full tool schemas preserved)...")
+        step_num = 0
+        try:
+            # Use iter() for step-by-step execution with logging
+            async with agent.iter(execution_prompt) as agent_run:
+                async for node in agent_run:
+                    step_num += 1
+                    node_type = type(node).__name__
+                    logger.info(f"[Step {step_num}] {node_type}")
+
+                    # Log tool calls from CallToolsNode
+                    if isinstance(node, CallToolsNode):
+                        # The node has the model response with tool calls
+                        try:
+                            resp = getattr(node, "model_response", None)
+                            if resp:
+                                for part in getattr(resp, "parts", []):
+                                    if isinstance(part, ToolCallPart):
+                                        args_str = json.dumps(part.args, default=str)[
+                                            :500
+                                        ]
+                                        logger.info(
+                                            f"[Step {step_num}] TOOL CALL: "
+                                            f"{part.tool_name}({args_str})"
+                                        )
+                        except Exception as log_err:
+                            logger.debug(
+                                f"[Step {step_num}] Could not log tool call: {log_err}"
+                            )
+
+                    # Log model request nodes (contain tool returns)
+                    if isinstance(node, ModelRequestNode):
+                        try:
+                            request = getattr(node, "request", None)
+                            if request:
+                                for part in getattr(request, "parts", []):
+                                    if isinstance(part, ToolReturnPart):
+                                        content_str = str(part.content)[:500]
+                                        logger.info(
+                                            f"[Step {step_num}] TOOL RESULT "
+                                            f"({part.tool_name}): {content_str}"
+                                        )
+                                    elif isinstance(part, RetryPromptPart):
+                                        logger.warning(
+                                            f"[Step {step_num}] RETRY: {part.content}"
+                                        )
+                        except Exception as log_err:
+                            logger.debug(
+                                f"[Step {step_num}] Could not log request: {log_err}"
+                            )
+
+                    # Log any node attrs for debugging
+                    try:
+                        node_attrs = [
+                            a
+                            for a in dir(node)
+                            if not a.startswith("_") and a not in ("run",)
+                        ]
+                        logger.debug(f"[Step {step_num}] Node attrs: {node_attrs}")
+                    except Exception:
+                        pass
+
+                # Get final result
+                result = agent_run.result
+                logger.info(f"Agent completed after {step_num} steps")
+
+        except Exception as run_error:
+            logger.error(
+                f"Agent execution failed at step {step_num}: "
+                f"{type(run_error).__name__}: {run_error}",
+            )
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            raise
+
+        # Extract result
+        if hasattr(result, "data"):
+            report = getattr(result, "data")
+        elif hasattr(result, "output"):
+            report = getattr(result, "output")
+        else:
+            report = str(result)
+
+        logger.info("Accounting task completed successfully")
 
         return {
             "success": True,
             "status": "completed",
-            "report": execution_report,
+            "report": report,
         }
 
     except Exception as e:
-        logger.error(f"Accounting task workflow failed: {e}", exc_info=True)
+        logger.error(
+            f"Accounting task failed: {type(e).__name__}: {e}",
+        )
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         return {"success": False, "status": "failed", "error": str(e)}

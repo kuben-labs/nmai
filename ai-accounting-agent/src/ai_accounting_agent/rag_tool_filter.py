@@ -4,19 +4,20 @@ This module provides functionality to:
 1. Extract and embed all available MCP tools
 2. Store embeddings in a vector database (LanceDB)
 3. Filter tools based on semantic similarity to task prompts
-4. Return only relevant tools to stay within context limits
+4. Return relevant tool names (set[str]) for use with FilteredToolset
+
+The actual tool filtering is done by pydantic-ai's native FilteredToolset,
+which preserves full parameter schemas. This module only handles the
+embedding index and semantic search to determine WHICH tools are relevant.
 """
 
 import json
 import asyncio
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Set, Tuple
 from dataclasses import dataclass
 
 from loguru import logger
-from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
-from pydantic_ai._run_context import RunContext
-from pydantic_ai.tools import ToolDefinition
 
 try:
     import lancedb
@@ -52,38 +53,6 @@ class ToolEmbedder:
         else:
             self.provider = embedding_provider
 
-    async def embed_tool(self, tool: ToolMetadata) -> ToolMetadata:
-        """Embed a single tool's description.
-
-        Args:
-            tool: The tool metadata to embed
-
-        Returns:
-            Tool metadata with embedding added
-        """
-        if self.provider is None:
-            logger.warning("No embedding provider configured, skipping embeddings")
-            return tool
-
-        try:
-            # Create a rich text representation of the tool
-            tool_text = f"""
-Tool: {tool.name}
-Description: {tool.description}
-Parameters: {json.dumps(tool.parameters, indent=2, default=str)}
-            """.strip()
-
-            # Get embedding using the provider's embed method
-            # The embed method takes a list of strings and returns a list of embeddings
-            embeddings = await asyncio.to_thread(self.provider.embed, [tool_text])
-            if embeddings and len(embeddings) > 0:
-                tool.embedding = embeddings[0]
-            return tool
-
-        except Exception as e:
-            logger.warning(f"Failed to embed tool {tool.name}: {e}")
-            return tool
-
     async def embed_tools_batch(
         self, tools: List[ToolMetadata], batch_size: int = 32
     ) -> List[ToolMetadata]:
@@ -108,10 +77,10 @@ Parameters: {json.dumps(tool.parameters, indent=2, default=str)}
             logger.debug(f"Embedding batch {i // batch_size + 1} ({len(batch)} tools)")
 
             try:
-                # Create rich text representations, limiting parameter size
+                # Create text representations for embedding
                 tool_texts = []
                 for tool in batch:
-                    # Limit parameters JSON to first 2000 chars to avoid huge requests
+                    # Limit parameters JSON to first 2000 chars for embedding
                     params_str = json.dumps(tool.parameters, indent=2, default=str)
                     if len(params_str) > 2000:
                         params_str = params_str[:2000] + "..."
@@ -152,7 +121,6 @@ Parameters: {params_str}
             return []
 
         try:
-            # Use the provider's embed method
             embeddings = await asyncio.to_thread(self.provider.embed, [text])
             if embeddings and len(embeddings) > 0:
                 return embeddings[0]
@@ -163,13 +131,7 @@ Parameters: {params_str}
 
 
 class ToolVectorStore:
-    """Manages tool embeddings and vector similarity search using LanceDB.
-
-    LanceDB provides:
-    - Persistent vector storage on disk
-    - Fast vector similarity search
-    - Automatic embedding persistence
-    """
+    """Manages tool embeddings and vector similarity search using LanceDB."""
 
     def __init__(self, db_path: str = ".tool_embeddings"):
         """Initialize the vector store using LanceDB.
@@ -180,7 +142,6 @@ class ToolVectorStore:
         self.db_path = Path(db_path)
         self.db_path.mkdir(exist_ok=True)
 
-        # Initialize LanceDB
         if lancedb is None:
             raise ImportError(
                 "lancedb is required for RAG tool filtering. Install with: uv add lancedb"
@@ -196,11 +157,8 @@ class ToolVectorStore:
     def _load_from_disk(self):
         """Load tools from LanceDB if the table exists."""
         try:
-            # Try to open existing table
             if "tools" in self.db.table_names():
                 self.table = self.db.open_table("tools")
-
-                # Load all records from the table
                 records = self.table.search().limit(10000).to_list()
 
                 for record in records:
@@ -223,7 +181,6 @@ class ToolVectorStore:
     def _save_to_disk(self):
         """Save tools to LanceDB with embeddings."""
         try:
-            # Prepare data for LanceDB
             records = []
             for tool_name, tool in self.tools.items():
                 records.append(
@@ -240,14 +197,11 @@ class ToolVectorStore:
                 logger.warning("No tools to save")
                 return
 
-            # Create or overwrite the table
-            # LanceDB automatically creates vector index for 'embedding' column
             if self.table is None:
                 self.table = self.db.create_table(
                     "tools", data=records, mode="overwrite"
                 )
             else:
-                # Delete old table and create new one with embeddings
                 self.db.drop_table("tools")
                 self.table = self.db.create_table(
                     "tools", data=records, mode="overwrite"
@@ -260,15 +214,11 @@ class ToolVectorStore:
             raise
 
     def add_tool(self, tool: ToolMetadata) -> None:
-        """Add a tool to the vector store.
-
-        Args:
-            tool: The tool metadata to add
-        """
+        """Add a tool to the vector store."""
         self.tools[tool.name] = tool
 
     def find_similar_tools(
-        self, query_embedding: List[float], top_k: int = 300
+        self, query_embedding: List[float], top_k: int = 100
     ) -> List[Tuple[str, float]]:
         """Find similar tools using LanceDB vector search.
 
@@ -288,16 +238,12 @@ class ToolVectorStore:
             return [(name, 0.0) for name in list(self.tools.keys())[:top_k]]
 
         try:
-            # LanceDB vector search returns results with score (distance)
-            # Smaller distance = more similar
             results = self.table.search(query_embedding).limit(top_k).to_list()
 
-            # Convert distance to similarity score (1 / (1 + distance))
             tool_scores = []
             for result in results:
                 tool_name = result.get("name", "")
                 distance = result.get("_distance", 0.0)
-                # Convert distance to similarity: 1 / (1 + distance)
                 similarity = 1.0 / (1.0 + distance)
                 tool_scores.append((tool_name, similarity))
 
@@ -306,339 +252,11 @@ class ToolVectorStore:
 
         except Exception as e:
             logger.error(f"LanceDB search failed: {e}")
-            # Fallback: return all tools without scores
             return [(name, 0.0) for name in list(self.tools.keys())[:top_k]]
 
-    def get_all_tools(self) -> List[ToolMetadata]:
-        """Get all tools in the store.
-
-        Returns:
-            List of all tools
-        """
-        return list(self.tools.values())
-
-
-class RAGToolFilter(AbstractToolset):
-    """Filters tools based on semantic similarity to task prompts.
-
-    This wrapper reduces context size by only loading tools relevant to the
-    current task, using RAG (Retrieval Augmented Generation) principles.
-    """
-
-    def __init__(
-        self,
-        wrapped_toolset: Any,
-        vector_store: ToolVectorStore,
-        embedder: ToolEmbedder,
-        task_prompt: str,
-        top_k: int = 300,
-    ):
-        """Initialize the RAG tool filter.
-
-        Args:
-            wrapped_toolset: The underlying MCP toolset to wrap
-            vector_store: The tool vector store for similarity search
-            embedder: The embedder for semantic search
-            task_prompt: The current task prompt to filter tools for
-            top_k: Number of top relevant tools to return
-        """
-        self.wrapped_toolset = wrapped_toolset
-        self.vector_store = vector_store
-        self.embedder = embedder
-        self.task_prompt = task_prompt
-        self.top_k = top_k
-        self._relevant_tool_names: Optional[set] = None
-        self._original_class_name = wrapped_toolset.__class__.__name__
-
-    @property
-    def id(self) -> str:
-        """Return a unique ID for this toolset.
-
-        Required by AbstractToolset interface.
-        """
-        return f"rag-filtered-{self._original_class_name}"
-
-    async def _get_relevant_tool_names(self) -> set:
-        """Get the set of relevant tool names for this task.
-
-        Returns:
-            Set of tool names that are relevant
-        """
-        if self._relevant_tool_names is not None:
-            return self._relevant_tool_names
-
-        try:
-            # Embed the task prompt
-            query_embedding = await self.embedder.embed_text(self.task_prompt)
-
-            # Find similar tools - now returns list of (tool_name, score) tuples
-            similar_tool_scores = self.vector_store.find_similar_tools(
-                query_embedding, top_k=self.top_k
-            )
-
-            # Extract just the tool names
-            self._relevant_tool_names = {
-                tool_name for tool_name, score in similar_tool_scores
-            }
-
-            logger.info(
-                f"RAG Filter: Found {len(self._relevant_tool_names)} relevant tools "
-                f"(from {len(self.vector_store.tools)} total) for task"
-            )
-
-            return self._relevant_tool_names
-
-        except Exception as e:
-            logger.error(f"Error getting relevant tools: {e}")
-            # Fallback: return all tools
-            return set(self.vector_store.tools.keys())
-
-    async def get_tools(self, ctx: RunContext[Any]) -> dict[str, ToolsetTool[Any]]:
-        """Get only the relevant tools for this task with minimal schemas.
-
-        Required by AbstractToolset interface.
-
-        Args:
-            ctx: The run context
-
-        Returns:
-            Dictionary of filtered tools with minimal schemas
-        """
-        try:
-            # Get all tools from wrapped toolset
-            all_tools = await self.wrapped_toolset.get_tools(ctx)
-            logger.info(
-                f"RAGToolFilter.get_tools(): Received {len(all_tools)} tools from wrapped toolset"
-            )
-
-            # Get relevant tool names
-            relevant_names = await self._get_relevant_tool_names()
-            logger.info(
-                f"RAGToolFilter.get_tools(): Filtering to {len(relevant_names)} relevant tools"
-            )
-
-            # Filter tools - keep only relevant ones
-            filtered_tools = {
-                name: tool for name, tool in all_tools.items() if name in relevant_names
-            }
-
-            # CRITICAL: Replace huge parameter schemas with minimal valid schemas
-            # This reduces token usage while keeping tools functional
-            simplified_tools = {}
-
-            def sanitize_schema(schema, depth=0):
-                """Recursively sanitize schema to avoid $ref and excessive depth."""
-                if not isinstance(schema, dict):
-                    return schema
-
-                # Strip $defs completely to avoid pydantic-ai parsing issues with them
-                if depth == 0 and "$defs" in schema:
-                    schema = dict(schema)
-                    del schema["$defs"]
-
-                # If this is a reference, replace it with a generic object
-                if "$ref" in schema:
-                    return {"type": "object", "description": "Complex object"}
-
-                # If we're too deep, and this looks like a schema object, replace it
-                if depth > 2 and schema.get("type") in ("object", "array"):
-                    if schema.get("type") == "array":
-                        return {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "description": "Complex object",
-                            },
-                        }
-                    return {"type": "object", "description": "Complex object"}
-
-                sanitized = {}
-                for k, v in schema.items():
-                    if isinstance(v, dict):
-                        sanitized[k] = sanitize_schema(v, depth + 1)
-                    elif isinstance(v, list):
-                        sanitized[k] = [
-                            sanitize_schema(i, depth + 1) if isinstance(i, dict) else i
-                            for i in v
-                        ]
-                    else:
-                        sanitized[k] = v
-                return sanitized
-
-            for name, tool in filtered_tools.items():
-                try:
-                    # Replace the tool_def's parameters_json_schema with a minimal but valid schema
-                    # that still accepts the required parameters
-                    if hasattr(tool, "tool_def") and hasattr(
-                        tool.tool_def, "parameters_json_schema"
-                    ):
-                        original_schema = tool.tool_def.parameters_json_schema or {}
-                        sanitized_schema = sanitize_schema(original_schema)
-                        tool.tool_def.parameters_json_schema = sanitized_schema
-
-                    simplified_tools[name] = tool
-                except Exception as e:
-                    logger.debug(f"Could not simplify tool {name}: {e}")
-                    simplified_tools[name] = tool
-
-            logger.info(
-                f"RAGToolFilter.get_tools(): Filtered tools from {len(all_tools)} to {len(simplified_tools)} "
-                f"and replaced parameter schemas with minimal schemas"
-            )
-
-            return simplified_tools
-
-        except Exception as e:
-            logger.error(f"Error in get_tools: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return await self.wrapped_toolset.get_tools(ctx)
-
-    async def list_tools(self) -> list:
-        """List only the relevant tools for this task with minimal schemas.
-
-        This method is called by some agents to get tool information.
-        We replace huge parameter schemas with minimal but valid schemas.
-
-        Returns:
-            List of filtered tool definitions with minimal schemas
-        """
-        try:
-            # Get all tools from wrapped toolset
-            all_tools = await self.wrapped_toolset.list_tools()  # type: ignore
-            logger.info(
-                f"RAGToolFilter.list_tools(): Received {len(all_tools)} tools from wrapped toolset"
-            )
-
-            # Get relevant tool names
-            relevant_names = await self._get_relevant_tool_names()
-            logger.info(
-                f"RAGToolFilter.list_tools(): Filtering to {len(relevant_names)} relevant tools"
-            )
-
-            # Filter tools - keep only relevant ones
-            filtered_tools = [tool for tool in all_tools if tool.name in relevant_names]
-
-            # CRITICAL: Replace huge parameter schemas with minimal valid schemas
-            # This reduces token usage while keeping tools functional
-            simplified_tools = []
-
-            def sanitize_schema(schema, depth=0):
-                """Recursively sanitize schema to avoid $ref and excessive depth."""
-                if not isinstance(schema, dict):
-                    return schema
-
-                # Strip $defs completely to avoid pydantic-ai parsing issues with them
-                if depth == 0 and "$defs" in schema:
-                    schema = dict(schema)
-                    del schema["$defs"]
-
-                # If this is a reference, replace it with a generic object
-                if "$ref" in schema:
-                    return {"type": "object", "description": "Complex object"}
-
-                # If we're too deep, and this looks like a schema object, replace it
-                if depth > 2 and schema.get("type") in ("object", "array"):
-                    if schema.get("type") == "array":
-                        return {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "description": "Complex object",
-                            },
-                        }
-                    return {"type": "object", "description": "Complex object"}
-
-                sanitized = {}
-                for k, v in schema.items():
-                    if isinstance(v, dict):
-                        sanitized[k] = sanitize_schema(v, depth + 1)
-                    elif isinstance(v, list):
-                        sanitized[k] = [
-                            sanitize_schema(i, depth + 1) if isinstance(i, dict) else i
-                            for i in v
-                        ]
-                    else:
-                        sanitized[k] = v
-                return sanitized
-
-            for tool in filtered_tools:
-                try:
-                    # Create a new ToolDefinition with minimal schema
-                    if isinstance(tool, ToolDefinition):
-                        # Extract required fields from original schema
-                        original_schema = tool.parameters_json_schema or {}
-
-                        sanitized_schema = sanitize_schema(original_schema)
-
-                        # Create new ToolDefinition with sanitized schema
-                        simplified_tool = ToolDefinition(
-                            name=tool.name,
-                            description=tool.description,
-                            parameters_json_schema=sanitized_schema,
-                        )
-                        simplified_tools.append(simplified_tool)
-                    else:
-                        # Fallback for non-ToolDefinition objects
-                        simplified_tools.append(tool)
-                except Exception as e:
-                    logger.debug(f"Could not simplify tool {tool.name}: {e}")
-                    simplified_tools.append(tool)
-
-            logger.info(
-                f"RAGToolFilter.list_tools(): Filtered tools from {len(all_tools)} to {len(simplified_tools)} "
-                f"and replaced parameter schemas with minimal schemas"
-            )
-
-            return simplified_tools
-
-        except Exception as e:
-            logger.error(f"Error in list_tools: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return await self.wrapped_toolset.list_tools()
-
-    async def call_tool(
-        self,
-        name: str,
-        tool_args: dict[str, Any],
-        ctx: RunContext[Any],
-        tool: ToolsetTool[Any],
-    ) -> Any:
-        """Call a tool, filtering out tools not in the relevant set.
-
-        Args:
-            name: Name of the tool to call
-            tool_args: Input parameters for the tool
-            ctx: The run context
-            tool: The tool definition
-
-        Returns:
-            The tool result
-
-        Raises:
-            ValueError: If the tool is not in the relevant set
-        """
-        relevant_names = await self._get_relevant_tool_names()
-
-        if name not in relevant_names:
-            error_msg = (
-                f"Tool '{name}' is not in the relevant tool set for this task. "
-                f"Use one of: {', '.join(sorted(relevant_names))}"
-            )
-            logger.warning(error_msg)
-            raise ValueError(error_msg)
-
-        # Delegate to wrapped toolset with correct signature
-        # Let all exceptions bubble up so the agent can see error messages
-        result = await self.wrapped_toolset.call_tool(name, tool_args, ctx, tool)
-        return result
-
-    def __getattr__(self, name):
-        """Delegate all other attributes to the wrapped toolset."""
-        return getattr(self.wrapped_toolset, name)
+    def get_all_tool_names(self) -> Set[str]:
+        """Get all tool names in the store."""
+        return set(self.tools.keys())
 
 
 async def index_mcp_tools(
@@ -647,8 +265,6 @@ async def index_mcp_tools(
     embedder: ToolEmbedder,
 ) -> None:
     """Index all tools from MCP toolsets into the vector store.
-
-    This extracts tools from MCP toolsets using list_tools() and embeds them in batches.
 
     Args:
         toolsets: List of MCP toolsets
@@ -660,7 +276,6 @@ async def index_mcp_tools(
     total_tools = 0
     for toolset in toolsets:
         try:
-            # Use list_tools() to get all tools from the toolset (it's async)
             tools_list = await toolset.list_tools()  # type: ignore
             logger.info(
                 f"Extracted {len(tools_list)} tools from {toolset.__class__.__name__}"
@@ -676,17 +291,17 @@ async def index_mcp_tools(
                 )
                 tool_metadata_list.append(tool_metadata)
 
-            # Embed tools in batches for efficiency
+            # Embed tools in batches
             embedded_tools = await embedder.embed_tools_batch(
                 tool_metadata_list, batch_size=32
             )
 
-            # Store all tools in vector store
+            # Store all tools
             for tool in embedded_tools:
                 vector_store.add_tool(tool)
                 total_tools += 1
 
-            # Save to disk after processing each toolset
+            # Save to disk
             vector_store._save_to_disk()
 
         except Exception as e:
@@ -698,37 +313,47 @@ async def index_mcp_tools(
     logger.info(f"Tool indexing complete: {total_tools} tools indexed")
 
 
-async def create_filtered_toolsets(
-    toolsets: List[Any],
+async def get_relevant_tool_names(
     vector_store: ToolVectorStore,
     embedder: ToolEmbedder,
     task_prompt: str,
-    top_k: int = 300,
-) -> List[RAGToolFilter]:
-    """Create filtered versions of toolsets for a specific task.
+    top_k: int = 100,
+) -> Set[str]:
+    """Get the set of relevant tool names for a task using RAG similarity search.
+
+    This is the main entry point for tool filtering. Returns a set of tool names
+    that can be used with pydantic-ai's FilteredToolset to filter the MCP toolset
+    while preserving full parameter schemas.
 
     Args:
-        toolsets: Original MCP toolsets
         vector_store: The populated vector store
-        embedder: The embedder
-        task_prompt: The task prompt to filter for
-        top_k: Number of top relevant tools to include
+        embedder: The embedder for embedding the task prompt
+        task_prompt: The task prompt to find relevant tools for
+        top_k: Number of top relevant tools to return
 
     Returns:
-        List of filtered toolsets
+        Set of relevant tool names
     """
-    logger.info(f"Creating RAG-filtered toolsets for task: {task_prompt[:100]}...")
+    try:
+        # Embed the task prompt
+        query_embedding = await embedder.embed_text(task_prompt)
 
-    filtered = []
-    for toolset in toolsets:
-        filtered_toolset = RAGToolFilter(
-            wrapped_toolset=toolset,
-            vector_store=vector_store,
-            embedder=embedder,
-            task_prompt=task_prompt,
-            top_k=top_k,
+        # Find similar tools
+        similar_tool_scores = vector_store.find_similar_tools(
+            query_embedding, top_k=top_k
         )
-        filtered.append(filtered_toolset)
 
-    logger.info(f"Created {len(filtered)} filtered toolsets")
-    return filtered
+        # Extract just the tool names
+        relevant_names = {tool_name for tool_name, score in similar_tool_scores}
+
+        logger.info(
+            f"RAG search: Found {len(relevant_names)} relevant tools "
+            f"(from {len(vector_store.tools)} total) for task: {task_prompt[:80]}..."
+        )
+
+        return relevant_names
+
+    except Exception as e:
+        logger.error(f"Error getting relevant tools: {e}")
+        # Fallback: return all tools
+        return vector_store.get_all_tool_names()

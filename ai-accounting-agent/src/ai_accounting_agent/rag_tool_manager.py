@@ -1,16 +1,18 @@
-"""Integration of RAG tool filtering into the agent initialization pipeline."""
+"""Simplified RAG tool manager - handles embedding index and returns relevant tool names.
 
-import asyncio
-from typing import List, Any, Optional
+This module manages the embedding index lifecycle and provides a simple interface
+to get relevant tool names for a task. The actual tool filtering is done by
+pydantic-ai's native FilteredToolset, which preserves full parameter schemas.
+"""
+
+from typing import List, Any, Optional, Set
 from loguru import logger
 
-from pydantic_ai.toolsets import AbstractToolset
-
 from .rag_tool_filter import (
-    RAGToolFilter,
     ToolVectorStore,
     ToolEmbedder,
     index_mcp_tools,
+    get_relevant_tool_names,
 )
 
 
@@ -19,15 +21,15 @@ class RAGToolManager:
 
     This manager handles:
     - Lazy initialization of embedder and vector store
-    - Tool indexing and embedding
-    - Creation of filtered toolsets per task
+    - Tool indexing and embedding (once at startup)
+    - Returning relevant tool names per task (fast lookup)
     """
 
     def __init__(
         self,
         embedding_provider: Optional[Any] = None,
         vector_store_path: str = ".tool_embeddings",
-        top_k: int = 300,
+        top_k: int = 100,
     ):
         """Initialize the RAG tool manager.
 
@@ -51,14 +53,12 @@ class RAGToolManager:
         logger.info("Initializing RAG tool manager...")
 
         try:
-            # Initialize embedder
             self.embedder = ToolEmbedder(embedding_provider=self.embedding_provider)
             logger.info("Embedder initialized")
 
-            # Initialize vector store
             self.vector_store = ToolVectorStore(db_path=self.vector_store_path)
             logger.info(
-                f"Vector store initialized with {len(self.vector_store.tools)} tools"
+                f"Vector store initialized with {len(self.vector_store.tools)} cached tools"
             )
 
             self._initialized = True
@@ -68,8 +68,8 @@ class RAGToolManager:
             logger.error(f"Failed to initialize RAG tool manager: {e}")
             raise
 
-    async def index_toolsets(self, toolsets: List[AbstractToolset[Any]]) -> None:
-        """Index tools from toolsets.
+    async def index_toolsets(self, toolsets: List[Any]) -> None:
+        """Index tools from MCP toolsets into the vector store.
 
         Args:
             toolsets: List of MCP toolsets to index
@@ -88,8 +88,7 @@ class RAGToolManager:
             )
             if tools_with_embeddings > 0:
                 logger.info(
-                    f"Skipping tool indexing: {len(self.vector_store.tools)} tools already indexed "
-                    f"with embeddings"
+                    f"Skipping tool indexing: {len(self.vector_store.tools)} tools already indexed"
                 )
                 return
 
@@ -99,110 +98,40 @@ class RAGToolManager:
             embedder=self.embedder,
         )
 
-    async def filter_tools_async(
-        self, query: str, top_k: Optional[int] = None
-    ) -> List[dict]:
-        """Filter tools based on semantic relevance to a query (async).
+    async def get_relevant_names(
+        self, task_prompt: str, top_k: Optional[int] = None
+    ) -> Set[str]:
+        """Get the set of relevant tool names for a task.
+
+        This is the main interface for tool filtering. Returns a set of tool names
+        that can be used with FilteredToolset to filter tools while preserving
+        full parameter schemas.
 
         Args:
-            query: The query to filter tools for
-            top_k: Number of top tools to return (defaults to manager's top_k)
+            task_prompt: The task prompt to find relevant tools for
+            top_k: Override for the number of tools to return
 
         Returns:
-            List of filtered tool metadata dicts with similarity scores
+            Set of relevant tool names
         """
         if not self._initialized:
             await self.initialize()
 
         if self.vector_store is None or self.embedder is None:
             logger.error("Vector store or embedder not initialized")
-            return []
+            return set()
 
         k = top_k or self.top_k
 
-        # Embed the query
-        query_embedding = await self.embedder.embed_text(query)
-        if not query_embedding:
-            logger.warning("Failed to embed query, returning random tools")
-            all_tools = list(self.vector_store.tools.items())
-            random_tools = all_tools[:k]
-            return [
-                {
-                    "id": name,
-                    "name": tool.name,
-                    "description": tool.description[:100] + "..."
-                    if len(tool.description) > 100
-                    else tool.description,
-                    "score": 0.0,
-                }
-                for name, tool in random_tools
-            ]
-
-        # Find similar tools - now returns list of (tool_name, score) tuples
-        similar_tool_scores = self.vector_store.find_similar_tools(
-            query_embedding, top_k=k
+        return await get_relevant_tool_names(
+            vector_store=self.vector_store,
+            embedder=self.embedder,
+            task_prompt=task_prompt,
+            top_k=k,
         )
 
-        # Format results with actual similarity scores from LanceDB
-        filtered_tools = []
-        for tool_name, score in similar_tool_scores:
-            if tool_name in self.vector_store.tools:
-                tool = self.vector_store.tools[tool_name]
-                filtered_tools.append(
-                    {
-                        "id": tool_name,
-                        "name": tool.name,
-                        "description": tool.description[:100] + "..."
-                        if len(tool.description) > 100
-                        else tool.description,
-                        "score": score,
-                    }
-                )
-
-        logger.info(f"RAG Filter: Found {len(filtered_tools)} relevant tools for query")
-        return filtered_tools
-
-    async def create_filtered_toolsets(
-        self, toolsets: List[Any], task_prompt: str
-    ) -> List[RAGToolFilter]:
-        """Create filtered versions of toolsets for a specific task.
-
-        Args:
-            toolsets: Original MCP toolsets
-            task_prompt: The task prompt to filter tools for
-
-        Returns:
-            List of RAG-filtered toolsets
-        """
-        if not self._initialized:
-            await self.initialize()
-
-        if self.vector_store is None or self.embedder is None:
-            logger.error("Vector store or embedder not initialized")
-            return []
-
-        logger.info(f"Creating RAG-filtered toolsets for task: {task_prompt[:100]}...")
-
-        filtered = []
-        for toolset in toolsets:
-            filtered_toolset = RAGToolFilter(
-                wrapped_toolset=toolset,
-                vector_store=self.vector_store,
-                embedder=self.embedder,
-                task_prompt=task_prompt,
-                top_k=self.top_k,
-            )
-            filtered.append(filtered_toolset)
-
-        logger.info(f"Created {len(filtered)} RAG-filtered toolsets")
-        return filtered
-
     def get_statistics(self) -> dict:
-        """Get statistics about the tool database.
-
-        Returns:
-            Dictionary with tool statistics
-        """
+        """Get statistics about the tool database."""
         if not self._initialized or self.vector_store is None:
             return {"status": "not initialized"}
 
@@ -225,7 +154,7 @@ class RAGToolManager:
 def create_rag_tool_manager(
     embedding_provider: Optional[Any] = None,
     vector_store_path: str = ".tool_embeddings",
-    top_k: int = 300,
+    top_k: int = 100,
 ) -> RAGToolManager:
     """Factory function to create a RAG tool manager.
 
@@ -235,7 +164,7 @@ def create_rag_tool_manager(
         top_k: Number of top tools to return
 
     Returns:
-        Initialized RAGToolManager instance
+        RAGToolManager instance
     """
     return RAGToolManager(
         embedding_provider=embedding_provider,

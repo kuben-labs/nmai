@@ -1,22 +1,29 @@
+"""Test script for verifying MCP tool schemas are loaded correctly.
+
+With the new FilteredToolset approach, schemas are preserved as-is from the
+MCP server - no sanitization needed. This test just validates the tools load.
+"""
+
 import asyncio
-from src.ai_accounting_agent.coordinator import load_mcp_config, setup_mcp_toolsets
-from src.ai_accounting_agent.rag_tool_filter import sanitize_schema
+from src.ai_accounting_agent.coordinator import load_mcp_config, get_mcp_toolset
+
 
 async def test():
-    configs = load_mcp_config()
-    toolsets = setup_mcp_toolsets(configs)
-    all_tools = await toolsets[0].list_tools()
-    
-    for tool in all_tools:
+    toolset = get_mcp_toolset()
+    all_tools = await toolset.list_tools()
+
+    print(f"Total tools: {len(all_tools)}")
+
+    for tool in all_tools[:5]:
         schema = tool.inputSchema
-        if not schema:
-            continue
-        sanitized = sanitize_schema(schema)
-        # Check if properties has string values
-        props = sanitized.get("properties", {})
-        for k, v in props.items():
-            if not isinstance(v, dict):
-                print(f"Tool {tool.name} has non-dict property {k}: {v}")
+        print(f"\nTool: {tool.name}")
+        print(f"  Description: {(tool.description or '')[:80]}...")
+        if schema:
+            props = schema.get("properties", {})
+            print(f"  Properties: {list(props.keys())[:10]}")
+            if "$defs" in schema:
+                print(f"  Has $defs: {list(schema['$defs'].keys())[:5]}")
+
 
 if __name__ == "__main__":
     asyncio.run(test())
