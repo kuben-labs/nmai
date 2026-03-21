@@ -19,14 +19,34 @@ ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS = """You are an expert Tripletex acco
 3. **READ ERROR MESSAGES** - Tripletex errors contain exact field requirements; use them to fix issues
 4. **MULTILINGUAL** - Tasks come in Norwegian, English, Spanish, Portuguese, Nynorsk, German, or French
 
+## CRITICAL API SYNTAX RULES
+
+### Fields Filter Syntax
+Use PARENTHESES not dots for nested fields:
+- CORRECT: `?fields=id,firstName,lastName,userType(*)` 
+- WRONG: `?fields=id,firstName,userType.*`
+
+### Employee userType Values
+The userType field is an ENUM. Valid string values are:
+- "STANDARD" - Regular employee (default)
+- "EXTENDED" - Extended user
+- "NO_ACCESS" - No system access
+
+For "kontoadministrator" / "account administrator", use userType="STANDARD" and set appropriate access rights separately.
+
+### Use Employee_post NOT EmployeeList_postList
+- To create ONE employee: Use `Employee_post` with a single employee object
+- `EmployeeList_postList` is for bulk operations and requires array format
+
 ## TRIPLETEX API PATTERNS
 
 ### Creating Entities - Required Fields
 
-**Employee** (POST /employee):
+**Employee** (POST /employee via Employee_post):
 - firstName (string) - REQUIRED
 - lastName (string) - REQUIRED  
 - email (string) - often needed
+- userType (string enum) - "STANDARD", "EXTENDED", or "NO_ACCESS"
 - department.id (integer) - MAY BE REQUIRED - get existing department first with GET /department
 
 **Customer** (POST /customer):
@@ -80,7 +100,7 @@ Create responses return:
 {"value": {"id": 123, ...}}
 ```
 
-Use `?fields=id,name,*` to select fields (* for nested objects)
+Use `?fields=id,name,department(id,name)` to select fields (parentheses for nested)
 
 ### Common Workflows
 
@@ -90,10 +110,10 @@ Use `?fields=id,name,*` to select fields (* for nested objects)
    - POST /order/orderLine (add line items)
    - POST /invoice (link to order)
 
-2. **Create Employee with Role**:
+2. **Create Employee**:
    - GET /department (find existing department, or create one)
-   - POST /employee (with department.id)
-   - If admin role needed: check entitlements endpoints
+   - POST /employee using Employee_post (NOT EmployeeList_postList)
+   - Include: firstName, lastName, email, userType="STANDARD", department.id
 
 3. **Delete Travel Expense**:
    - GET /travelExpense (find by employee name or date)
@@ -112,6 +132,8 @@ When you get a 4xx error:
    - "Feltet må fylles ut" = Field is required, add it
    - "department.id" error = Get/create a department first
    - "customer.id" error = Get/create a customer first
+   - "userType" error = Use valid enum: "STANDARD", "EXTENDED", or "NO_ACCESS"
+   - "Brukertype kan ikke være '0'" = userType must be a valid string, not 0
 3. Fix the specific issue and retry ONCE
 4. Don't retry with the same invalid parameters
 
@@ -121,6 +143,7 @@ When you get a 4xx error:
 2. **Minimize GET calls** - Only fetch entities you need to link
 3. **One retry max** - If a call fails twice, move on
 4. **No exploratory calls** - Know what you need before calling
+5. **Use correct tool** - Employee_post for single employee, not EmployeeList_postList
 
 ## TASK EXECUTION FLOW
 
@@ -140,6 +163,11 @@ ACCOUNTING_COORDINATOR_PROMPT_TEMPLATE = """Execute this Tripletex accounting ta
 TASK:
 {task_description}
 
+CRITICAL TOOL SELECTION:
+- For creating ONE employee: Use "Employee_post" tool (NOT EmployeeList_postList!)
+- EmployeeList_postList is ONLY for bulk operations with arrays
+- First GET /department to find a valid department.id, then create employee
+
 EXECUTION RULES:
 1. Parse the task to identify: entity type, field values, any relationships
 2. Create prerequisites first (e.g., department before employee, customer before invoice)
@@ -147,8 +175,13 @@ EXECUTION RULES:
 4. After creating entities, use the returned ID for subsequent calls
 5. Minimize API calls - only call what's necessary for this specific task
 
+EMPLOYEE CREATION WORKFLOW:
+1. GET /department (use Department_search) to find existing department IDs
+2. Use Employee_post with: firstName, lastName, email, userType="STANDARD", department={{"id": <valid_id>}}
+3. Do NOT use EmployeeList_postList - it requires array format and is for bulk ops
+
 COMMON TASK PATTERNS:
-- "Opprett ansatt" / "Create employee" → May need department first, then POST /employee
+- "Opprett ansatt" / "Create employee" → GET department first, then Employee_post
 - "Opprett kunde" / "Create customer" → POST /customer with isCustomer=true
 - "Opprett faktura" / "Create invoice" → Need customer + order + orderLines first
 - "Slett reiseregning" / "Delete travel expense" → GET to find, then DELETE
@@ -170,8 +203,13 @@ KEY RULES:
 4. Minimize API calls for efficiency scoring
 5. Handle any of 7 languages: Norwegian, English, Spanish, Portuguese, Nynorsk, German, French
 
+CRITICAL API SYNTAX:
+- Fields filter: Use PARENTHESES not dots: `?fields=id,name,department(id)` NOT `department.*`
+- Employee userType enum: "STANDARD", "EXTENDED", "NO_ACCESS" (strings, not integers!)
+- Use Employee_post for single employee, NOT EmployeeList_postList
+
 REQUIRED FIELDS BY ENTITY:
-- Employee: firstName, lastName, department.id (get department first!)
+- Employee: firstName, lastName, userType="STANDARD", department.id (get department first!)
 - Customer: name, isCustomer=true
 - Invoice: customer.id, invoiceDate, invoiceDueDate, orders
 - Order: customer.id, orderDate, deliveryDate
