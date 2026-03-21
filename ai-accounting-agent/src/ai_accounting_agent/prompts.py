@@ -153,6 +153,31 @@ WORKFLOW: Analyze Ledger and Create Projects
   4. For each account: Project_post({name: account_name, startDate, isInternal: true, projectManager: {id}})
   5. For each project: SEARCH Activity_search({name: "..."}) first, then ProjectProjectActivity_post using existing ID or creating new
 
+WORKFLOW: Record Expense from Receipt/Kvittering
+  This is for tasks that say "record expense", "book receipt", "kvittering", "Ausgabe", "quittung", "utgift".
+  DO NOT use LedgerVoucher_post for receipt expenses. Use the TravelExpense workflow:
+  1. Employee_search({count: 1}) → get an employee ID (expense must be linked to an employee)
+  2. Department_search({name: "..."}) → get department ID if specified
+  3. TravelExpense_post({employee: {id}, department: {id}, title: "description", date: receipt_date, deliveryPlace: {id: -1}}) → get expense_id
+     NOTE: deliveryPlace with id: -1 means "not applicable"
+  4. For each item on the receipt:
+     TravelExpenseCost_post({travelExpense: {id: expense_id}, date: receipt_date, description: "item name",
+       domesticAmount: item_amount_incl_vat, category: "expense_category",
+       costAccount: {id: expense_account_id}, vatType: {id: vat_id},
+       paymentType: "companyCard" or "cash", department: {id}})
+  5. TravelExpenseDeliver_deliver({id: expense_id}) → submit the expense
+  
+  COMMON EXPENSE ACCOUNTS:
+    - 6300: Leie lokale (rent)
+    - 6500: Verktøy/inventar (tools/inventory)  
+    - 6520: Hjelpeverktøy (auxiliary tools)
+    - 6540: Inventar (inventory/furniture)
+    - 6800: Kontorrekvisita (office supplies)
+    - 6900: Telefon/kommunikasjon (phone/communication)
+    - 7100: Bilgodtgjørelse (car allowance)
+    - 7140: Reisekostnad (travel costs)
+    - 7770: Bank og kortgebyrer (bank/card fees)
+
 WORKFLOW: Delete Travel Expense
   1. TravelExpense_search({}) → find by employee or date
   2. TravelExpense_delete({id: expense_id})
