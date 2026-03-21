@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.ruff_cache
+.pytest_cache
+.vscode
+.env.example
+notebooks
+docs
+Makefile
+.python-version

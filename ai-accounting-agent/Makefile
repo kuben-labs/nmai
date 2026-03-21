@@ -8,7 +8,7 @@ NC := \033[0m # No Color
 
 # Local development URLs
 MCP_URL := http://localhost:8083/mcp
-AGENT_URL := http://localhost:8000
+AGENT_URL := http://localhost:8080
 SOLVE_ENDPOINT := $(AGENT_URL)/solve
 
 # Load environment variables from ai-accountant-mcp/.env if it exists
@@ -42,9 +42,9 @@ dev: ## Start all services in development mode
 	@$(MAKE) -j3 kill-ports dev-mcp dev-agent
 
 
-kill-ports: ## Free development ports (8000, 8083)
-	@echo "$(YELLOW)Freeing development ports (8000, 8083)...$(NC)"
-	@for port in 8000 8083; do \
+kill-ports: ## Free development ports (8080, 8083)
+	@echo "$(YELLOW)Freeing development ports (8080, 8083)...$(NC)"
+	@for port in 8080 8083; do \
 		pids=$$(lsof -ti tcp:$$port 2>/dev/null); \
 		if [ -n "$$pids" ]; then \
 			echo "Stopping processes $$pids on port $$port"; \
@@ -60,7 +60,7 @@ dev-mcp: ## Start MCP server only
 
 dev-agent: ## Start Agent server only
 	@echo "$(BLUE)Starting Agent server on $(AGENT_URL)...$(NC)"
-	@cd src && uv run uvicorn ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8000 --reload
+	@uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --reload
 
 dev-cli: ## Start CLI mode for testing agents locally
 	@echo "$(BLUE)Starting Agent CLI mode...$(NC)"
@@ -87,6 +87,6 @@ test-health: ## Check if services are running
 	@curl -s http://localhost:8083/health 2>/dev/null || echo "MCP server not responding"
 	@echo ""
 	@echo "$(BLUE)Checking Agent server...$(NC)"
-	@curl -s http://localhost:8000/health 2>/dev/null || echo "Agent server not responding"
+	@curl -s http://localhost:8080/health 2>/dev/null || echo "Agent server not responding"
 # Default target
 .DEFAULT_GOAL := help

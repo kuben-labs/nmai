@@ -1,5 +1,6 @@
 __pycache__
 .ruff_cache__
 venv/
+.venv/
 .env
 .tool_embeddings/

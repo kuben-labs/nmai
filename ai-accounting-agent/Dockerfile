@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     git \
     lsb-release \
     gnupg \
+    build-essential \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -20,6 +21,10 @@ COPY . /app
 
 RUN uv pip install --system --no-cache .
 
-EXPOSE 8084
+# Copy entrypoint script
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
-CMD ["uv", "run", "python", "src/ai_accountant_agent/server.py"]
+EXPOSE 8080 8083
+
+CMD ["/app/entrypoint.sh"]
