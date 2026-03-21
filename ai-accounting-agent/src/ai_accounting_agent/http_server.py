@@ -202,31 +202,6 @@ def startup_event():
     logger.info("AI Accounting Agent starting up...")
     logger.info(f"LLM Model: {os.getenv('LLM_MODEL')}")
     logger.info(f"MCP Config: mcp_accountant.json")
-
-    # Validate MCP server is configured
-    logger.info("Validating MCP server configuration...")
-    try:
-        from urllib.request import urlopen
-        from urllib.error import URLError
-
-        try:
-            with urlopen("http://localhost:8083/mcp", timeout=2) as response:
-                if response.status == 200:
-                    logger.info(
-                        "✅ MCP server is reachable at http://localhost:8083/mcp"
-                    )
-                else:
-                    logger.warning(
-                        f"⚠️ MCP server responded with status {response.status}"
-                    )
-        except URLError as e:
-            logger.warning(
-                f"⚠️ Could not reach MCP server at http://localhost:8083/mcp: {e}"
-            )
-            logger.warning("   Accounting tasks may fail if MCP server is not running")
-    except Exception as e:
-        logger.warning(f"⚠️ Error validating MCP server: {e}")
-
     logger.info("Ready to accept /solve requests")
 
 
