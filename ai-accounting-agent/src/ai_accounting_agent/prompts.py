@@ -91,12 +91,17 @@ DEPARTMENT (Department_post):
 
 <workflows>
 WORKFLOW: Create Employee with Full Onboarding
-  1. Department_search({}) → get dept_id
-  2. Employee_post({firstName, lastName, email, userType: "STANDARD", department: {id: dept_id}}) → get employee_id
-  3. If employment details needed:
-     EmployeeEmployment_post({employee: {id}, startDate, employmentType: "ORDINARY", percentageOfFullTimeEquivalent: 100}) → get employment_id
-     EmployeeEmploymentDetails_post({employment: {id}, date: startDate, annualSalary, percentageOfFullTimeEquivalent: 100})
-     EmployeeStandardTime_post({employee: {id}, hoursPerDay: 7.5})
+  1. Department_search({name: "..."}) → get dept_id. If not found, Department_post to create.
+  2. Employee_post({firstName, lastName, email, dateOfBirth, userType: "NO_ACCESS", department: {id: dept_id}}) → get employee_id
+     NOTE: Use userType "NO_ACCESS" for regular employees, "STANDARD" only for admin/kontoadministrator.
+  3. EmployeeEmployment_post({employee: {id}, startDate, isMainEmployer: true}) → get employment_id
+     NOTE: Do NOT pass employmentType here — it goes in EmployeeEmploymentDetails_post.
+  4. Search for occupation code matching the job title:
+     EmployeeEmploymentOccupationCode_search({nameNO: "rådgiver"}) or ({nameNO: "konsulent"}) etc.
+     Use a SHORT keyword from the job title, not the full title. Try multiple searches if first returns nothing.
+  5. EmployeeEmploymentDetails_post({employment: {id}, date: startDate, employmentType: "ORDINARY", employmentForm: "PERMANENT", percentageOfFullTimeEquivalent: 100, annualSalary: amount, occupationCode: {id: code_id}})
+     CRITICAL: ALWAYS set occupationCode. Search for it in step 4.
+  6. EmployeeStandardTime_post({employee: {id}, hoursPerDay: 7.5, fromDate: startDate})
 
 WORKFLOW: Create Invoice (with or without products)
   1. Customer_search({organizationNumber: "..."}) → get customer_id
