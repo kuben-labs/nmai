@@ -48,8 +48,12 @@ STANDARD TIME (EmployeeStandardTime_post):
   COMMON: hoursPerDay (7.5)
 
 CUSTOMER (Customer_post):
-  REQUIRED: name, isCustomer: true
-  COMMON: organizationNumber, email
+  REQUIRED: name, isCustomer: true (ALWAYS include this)
+  COMMON: organizationNumber, email, phoneNumber, invoiceEmail
+  ADDRESS: When an address is provided, set BOTH postalAddress AND physicalAddress:
+    postalAddress: {addressLine1: "Street 10", postalCode: "6003", city: "Ålesund", country: {id: 161}}
+    physicalAddress: {addressLine1: "Street 10", postalCode: "6003", city: "Ålesund", country: {id: 161}}
+    NOTE: country id 161 = Norway. Always include country.
 
 ORDER (Order_post):
   REQUIRED: customer: {id: N}, orderDate, deliveryDate
