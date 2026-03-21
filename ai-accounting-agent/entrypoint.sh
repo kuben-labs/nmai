@@ -1,17 +1,8 @@
 #!/bin/bash
 set -e
 
-# Start MCP server in the background
-echo "Starting MCP server..."
-cd /app/ai-accountant-mcp && python src/ai_accountant_mcp/server.py &
-MCP_PID=$!
+# No MCP server needed - agent calls Tripletex API directly via httpx
+# The OpenAPI spec is fetched at startup and tools are generated in-process
 
-# Give MCP server time to start
-sleep 10
-
-# Start Agent server in the foreground
-echo "Starting Agent server..."
+echo "Starting Agent server (direct API mode, no MCP)..."
 cd /app/ && python -m uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080
-
-# If agent exits, kill MCP server too
-trap "kill $MCP_PID 2>/dev/null || true" EXIT

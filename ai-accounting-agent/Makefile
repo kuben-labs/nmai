@@ -1,4 +1,4 @@
-.PHONY: help dev dev-all dev-mcp dev-agent install clean clean-ai-accountant
+.PHONY: help dev dev-agent install clean kill-ports test-health
 
 # Colors for output
 BLUE := \033[0;34m
@@ -7,7 +7,6 @@ YELLOW := \033[0;33m
 NC := \033[0m # No Color
 
 # Local development URLs
-MCP_URL := http://localhost:8083/mcp
 AGENT_URL := http://localhost:8080
 SOLVE_ENDPOINT := $(AGENT_URL)/solve
 
@@ -28,42 +27,32 @@ help: ## Show this help message
 	@echo "$(BLUE)AI Accounting Agent - Development Commands$(NC)"
 	@echo ""
 	@echo "$(YELLOW)Endpoints:$(NC)"
-	@echo "  MCP Server:     $(MCP_URL)"
 	@echo "  Agent Server:   $(AGENT_URL)"
 	@echo "  Solve Endpoint: $(SOLVE_ENDPOINT)"
+	@echo ""
+	@echo "$(YELLOW)Architecture: Direct API (no MCP server needed)$(NC)"
+	@echo "  Tools are generated from OpenAPI spec at startup"
+	@echo "  Agent calls Tripletex API directly via httpx"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "$(GREEN)%-25s$(NC) %s\n", $$1, $$2}'
 
 # Development commands
-dev-all: kill-ports ## Start all services (MCP + Agent) in parallel
-	@echo "$(YELLOW)Starting all services in parallel...$(NC)"
-	@trap 'kill 0' INT; \
-	(cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py) & \
-	sleep 3 && uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --reload & \
-	wait
+dev: kill-ports dev-agent ## Start the agent server (direct API mode, no MCP)
 
-dev: dev-all ## Start all services (alias for dev-all)
+dev-agent: ## Start Agent server
+	@echo "$(BLUE)Starting Agent server on $(AGENT_URL) (direct API mode)...$(NC)"
+	@uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --reload
 
-
-kill-ports: ## Free development ports (8080, 8083)
-	@echo "$(YELLOW)Freeing development ports (8080, 8083)...$(NC)"
-	@for port in 8080 8083; do \
-		pids=$$(lsof -ti tcp:$$port 2>/dev/null); \
-		if [ -n "$$pids" ]; then \
-			echo "Stopping processes $$pids on port $$port"; \
-			echo "$$pids" | xargs kill; \
-		else \
-			echo "No process found on port $$port"; \
-		fi; \
-	done
-
-dev-mcp: ## Start MCP server only
-	@echo "$(BLUE)Starting MCP server on $(MCP_URL)...$(NC)"
-	@cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py && sleep 5
-
-dev-agent: ## Start Agent server only
-	@echo "$(BLUE)Starting Agent server on $(AGENT_URL)...$(NC)"
-	@sleep 5 && uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --reload
+kill-ports: ## Free development ports
+	@echo "$(YELLOW)Freeing development ports (8080)...$(NC)"
+	@pids=$$(lsof -ti tcp:8080 2>/dev/null); \
+	if [ -n "$$pids" ]; then \
+		echo "Stopping processes $$pids on port 8080"; \
+		echo "$$pids" | xargs kill; \
+		sleep 1; \
+	else \
+		echo "No process found on port 8080"; \
+	fi
 
 dev-cli: ## Start CLI mode for testing agents locally
 	@echo "$(BLUE)Starting Agent CLI mode...$(NC)"
@@ -72,7 +61,6 @@ dev-cli: ## Start CLI mode for testing agents locally
 install: ## Install all dependencies
 	@echo "$(BLUE)Installing dependencies...$(NC)"
 	@uv sync
-
 
 clean: ## Clean all build artifacts and caches
 	@echo "$(BLUE)Cleaning project...$(NC)"
@@ -83,13 +71,11 @@ clean: ## Clean all build artifacts and caches
 	@echo "$(GREEN)✓ Clean complete$(NC)"
 
 # Test commands
-test-health: ## Check if services are running
+test-health: ## Check if agent server is running
 	@echo "$(YELLOW)Testing service health...$(NC)"
-	@echo ""
-	@echo "$(BLUE)Checking MCP server...$(NC)"
-	@curl -s http://localhost:8083/health 2>/dev/null || echo "MCP server not responding"
 	@echo ""
 	@echo "$(BLUE)Checking Agent server...$(NC)"
 	@curl -s http://localhost:8080/health 2>/dev/null || echo "Agent server not responding"
+
 # Default target
 .DEFAULT_GOAL := help

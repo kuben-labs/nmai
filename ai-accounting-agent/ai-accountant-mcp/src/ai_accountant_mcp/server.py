@@ -113,6 +113,11 @@ class DynamicAuthClient(httpx.AsyncClient):
 
     This allows credentials to be updated via environment variables
     between requests without restarting the server.
+
+    IMPORTANT: FastMCP's OpenAPI provider calls client.send(request) not
+    client.request(), and reads client.base_url to build URLs. So we must:
+    1. Update self._base_url when dynamic credentials change
+    2. Override send() to inject auth headers on prepared requests
     """
 
     def __init__(self, fallback_base_url: str, fallback_token: str, **kwargs):
@@ -124,42 +129,80 @@ class DynamicAuthClient(httpx.AsyncClient):
         )
         self._fallback_base_url = fallback_base_url
         self._fallback_token = fallback_token
+        self._current_base_url = fallback_base_url
+        self._current_token = fallback_token
 
-    def _get_current_auth(self) -> tuple[str, str]:
-        """Get current credentials from environment."""
+    def _sync_credentials(self):
+        """Sync dynamic credentials into the client's base_url and headers.
+
+        Called before every request to ensure FastMCP's OpenAPI provider
+        reads the correct base_url and auth headers.
+        """
         base_url, token = get_credentials()
         base_url = base_url or self._fallback_base_url
         token = token or self._fallback_token
-        return base_url, token
+
+        # Update base_url if it changed (FastMCP reads this via client.base_url)
+        if base_url != self._current_base_url:
+            logger.info(f"DynamicAuthClient: Switching base_url to {base_url}")
+            # Ensure trailing slash for correct URL joining by httpx
+            base_url_with_slash = base_url.rstrip("/") + "/"
+            self._base_url = httpx.URL(base_url_with_slash)
+            self._current_base_url = base_url
+
+        # Update default auth headers if token changed
+        if token != self._current_token:
+            logger.info(f"DynamicAuthClient: Updating auth token")
+            auth_header = encode_session_token(token)
+            self.headers["Authorization"] = auth_header
+            self._current_token = token
+
+    async def send(self, request: httpx.Request, **kwargs) -> httpx.Response:
+        """Override send() - FastMCP's OpenAPI provider uses this path.
+
+        FastMCP builds a full request using client.base_url and then calls
+        client.send(request). We must sync credentials before sending.
+        """
+        self._sync_credentials()
+
+        # If the request was built with the old base_url, rebuild the URL
+        request_url = str(request.url)
+        if (
+            self._current_base_url != self._fallback_base_url
+            and self._fallback_base_url in request_url
+        ):
+            new_url = request_url.replace(
+                self._fallback_base_url.rstrip("/"),
+                self._current_base_url.rstrip("/"),
+            )
+            logger.debug(
+                f"DynamicAuthClient.send: Rewriting URL {request_url[:80]} -> {new_url[:80]}"
+            )
+            request.url = httpx.URL(new_url)
+
+        # Inject current auth headers into the request
+        auth_header = encode_session_token(self._current_token)
+        request.headers["Authorization"] = auth_header
+        request.headers["Content-Type"] = "application/json"
+
+        logger.debug(
+            f"DynamicAuthClient.send: {request.method} {str(request.url)[:120]}"
+        )
+        return await super().send(request, **kwargs)
 
     async def request(self, method: str, url: Any, **kwargs) -> httpx.Response:
-        """Override request to inject dynamic credentials."""
-        base_url, token = self._get_current_auth()
+        """Override request() for direct API calls (fallback path)."""
+        self._sync_credentials()
 
-        # Convert URL to string
         url_str = str(url)
 
-        # If dynamic credentials differ from fallback, update headers
-        if token != self._fallback_token:
-            headers = dict(kwargs.get("headers", {}) or {})
-            headers["Authorization"] = encode_session_token(token)
-            headers["Content-Type"] = "application/json"
-            kwargs["headers"] = headers
+        # Inject auth headers
+        headers = dict(kwargs.get("headers", {}) or {})
+        headers["Authorization"] = encode_session_token(self._current_token)
+        headers["Content-Type"] = "application/json"
+        kwargs["headers"] = headers
 
-        # Check if we need to use a different base URL
-        if (
-            base_url
-            and base_url != self._fallback_base_url
-            and not url_str.startswith("http")
-        ):
-            url_str = f"{base_url.rstrip('/')}/{url_str.lstrip('/')}"
-            # When using full URL, headers from __init__ aren't applied automatically
-            headers = dict(kwargs.get("headers", {}) or {})
-            if "Authorization" not in headers:
-                headers["Authorization"] = encode_session_token(token)
-            headers["Content-Type"] = "application/json"
-            kwargs["headers"] = headers
-
+        # If URL is relative, it will use self._base_url (already synced above)
         logger.debug(f"DynamicAuthClient.request: {method} {url_str[:100]}")
         return await super().request(method, url_str, **kwargs)
 
@@ -284,6 +327,33 @@ def create_mcp_server():
             version="0.1.0",
             tags={"tripletex", "accounting", "api-v2"},
         )
+
+        # CRITICAL: Strip outputSchema from all tools.
+        # Tripletex API responses often have null fields where the OpenAPI
+        # spec says object is expected. The MCP SDK validates responses against
+        # outputSchema and rejects valid API responses (e.g., created entity
+        # with null manager field). This causes the agent to never see successful
+        # results and lose created entity IDs, causing cascading failures.
+        try:
+            tool_manager = getattr(mcp, "_tool_manager", None)
+            if tool_manager:
+                tools_dict = getattr(tool_manager, "_tools", {})
+                stripped_count = 0
+                for tool in tools_dict.values():
+                    # FastMCP Tool model has 'output_schema' field
+                    if (
+                        hasattr(tool, "output_schema")
+                        and tool.output_schema is not None
+                    ):
+                        tool.output_schema = None
+                        stripped_count += 1
+                logger.info(
+                    f"✓ Stripped output_schema from {stripped_count} tools (prevents false validation errors)"
+                )
+            else:
+                logger.warning("⚠ Could not find tool_manager to strip output_schema")
+        except Exception as e:
+            logger.warning(f"⚠ Failed to strip output_schema: {e} (non-fatal)")
 
         endpoint_count = len(openapi_spec.get("paths", {}))
         logger.info(f"✓ MCP server created with {endpoint_count} endpoints")

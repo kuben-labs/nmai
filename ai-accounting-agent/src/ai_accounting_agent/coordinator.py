@@ -1,21 +1,19 @@
 """Coordinator for accounting task execution.
 
-Simplified single-agent architecture:
-- One agent with RAG-filtered MCP tools (full schemas preserved)
-- Uses pydantic-ai's native FilteredToolset for tool filtering
-- No sub-agent hierarchy or planning overhead
+Direct OpenAPI tools architecture (no MCP):
+- Fetches OpenAPI spec at startup (cached)
+- Generates pydantic-ai Tools from endpoints
+- Agent calls Tripletex API directly via httpx
+- No separate MCP server process needed
 """
 
 import json
-import os
 import traceback
 from typing import Dict, List, Any, Optional, Set
 
 from loguru import logger
-from pydantic_ai import Agent
+from pydantic_ai import Agent, Tool
 from pydantic_ai.messages import (
-    ModelRequest,
-    ModelResponse,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -26,8 +24,6 @@ from pydantic_ai._agent_graph import (
     ModelRequestNode,
     UserPromptNode,
 )
-from pydantic_ai.tools import ToolDefinition
-from pydantic_ai.mcp import MCPServerStreamableHTTP
 
 from .llm import get_google_model
 from .embeddings import get_embedding_provider
@@ -36,59 +32,102 @@ from .prompts import (
     ACCOUNTING_TASK_PROMPT_TEMPLATE,
 )
 from .rag_tool_manager import create_rag_tool_manager
+from .openapi_tools import generate_tools_from_openapi, fetch_openapi_spec
 
-# Module-level cache for the RAG manager (shared across requests)
+# Module-level caches
 _rag_manager = None
 _rag_initialized = False
+_openapi_spec_cache: Optional[Dict[str, Any]] = None
+_tools_cache: Dict[str, List[Tool]] = {}  # keyed by base_url+token hash
 
 
-def load_mcp_config(config_path: str = "mcp_accountant.json") -> List[Dict[str, Any]]:
-    """Load MCP server configurations from a JSON file."""
-    try:
-        with open(config_path, "r") as f:
-            config_data = json.load(f)
+# Essential tools that must ALWAYS be available regardless of RAG filtering.
+ESSENTIAL_TOOLS = {
+    "Department_search",
+    "Department_post",
+    "Department_get",
+    "Employee_search",
+    "Employee_post",
+    "Employee_get",
+    "EmployeeEmployment_search",
+    "EmployeeEmployment_post",
+    "EmployeeEmployment_put",
+    "EmployeeEmploymentDetails_search",
+    "EmployeeEmploymentDetails_post",
+    "EmployeeEmploymentDetails_put",
+    "EmployeeEmploymentOccupationCode_search",
+    "EmployeeStandardTime_post",
+    "EmployeeStandardTime_put",
+    "EmployeeStandardTime_search",
+    "Customer_search",
+    "Customer_post",
+    "Customer_get",
+    "Supplier_search",
+    "Supplier_post",
+    "Product_search",
+    "Product_post",
+    "Contact_search",
+    "Contact_post",
+    "LedgerAccount_search",
+    "LedgerAccount_post",
+    "Order_search",
+    "Order_post",
+    "Order_get",
+    "OrderOrderline_post",
+    "OrderOrderline_get",
+    "Invoice_search",
+    "Invoice_post",
+    "Invoice_get",
+    "InvoiceSend_send",
+    "IncomingInvoiceSearch_search",
+    "IncomingInvoice_post",
+    "IncomingInvoice_get",
+    "IncomingInvoiceAddPayment_addPayment",
+    "LedgerVoucher_search",
+    "LedgerVoucher_post",
+    "LedgerVoucher_get",
+    "TravelExpense_search",
+    "TravelExpense_post",
+    "TravelExpense_delete",
+    "TravelExpense_get",
+    "Project_search",
+    "Project_post",
+    "ProjectParticipant_post",
+    "SupplierInvoice_search",
+    "SupplierInvoiceAddPayment_addPayment",
+    "SalaryType_search",
+    "SalaryTransaction_post",
+    "Division_search",
+    "Division_post",
+    "LedgerVatType_search",
+}
 
-        servers = []
-        for server_name, server_config in config_data.get("servers", {}).items():
-            servers.append(
-                {
-                    "name": server_name,
-                    "type": server_config.get("type", "http"),
-                    "url": server_config.get("url", ""),
-                }
-            )
 
-        logger.info(f"Loaded {len(servers)} MCP server(s) from {config_path}")
-        return servers
+async def _get_openapi_spec(base_url: str, session_token: str) -> Dict[str, Any]:
+    """Get OpenAPI spec, using cache if available.
 
-    except Exception as e:
-        logger.error(f"Failed to load MCP config from {config_path}: {e}")
-        return []
-
-
-def get_mcp_toolset(timeout: float = 300.0) -> MCPServerStreamableHTTP:
-    """Create the MCP toolset connection.
-
-    Args:
-        timeout: Timeout for MCP connections in seconds
-
-    Returns:
-        Configured MCP toolset
+    We fetch the spec from the sandbox URL (always available) and cache it.
+    The spec is the same regardless of which Tripletex instance we connect to.
     """
-    server_configs = load_mcp_config()
-    if not server_configs:
-        raise ValueError("No MCP servers configured")
+    global _openapi_spec_cache
 
-    config = server_configs[0]  # We only have one MCP server
-    url = config.get("url", "")
+    if _openapi_spec_cache is not None:
+        return _openapi_spec_cache
 
-    server = MCPServerStreamableHTTP(
-        url=url,
-        timeout=timeout,
-        max_retries=5,
-    )
-    logger.info(f"MCP toolset configured: {url}")
-    return server
+    # Fetch from sandbox (always available, spec is universal)
+    import os
+
+    sandbox_url = os.getenv("API_URL", "https://kkpqfuj-amager.tripletex.dev/v2")
+    sandbox_token = os.getenv("SESSION_TOKEN", "")
+
+    try:
+        spec = await fetch_openapi_spec(sandbox_url, sandbox_token)
+        _openapi_spec_cache = spec
+        logger.info(f"Fetched OpenAPI spec: {len(spec.get('paths', {}))} paths")
+        return spec
+    except Exception as e:
+        logger.error(f"Failed to fetch OpenAPI spec: {e}")
+        raise
 
 
 async def _get_rag_manager():
@@ -109,7 +148,7 @@ async def _get_rag_manager():
 
     _rag_manager = create_rag_tool_manager(
         embedding_provider=embedding_provider,
-        top_k=100,
+        top_k=200,
     )
     await _rag_manager.initialize()
     _rag_initialized = True
@@ -117,117 +156,24 @@ async def _get_rag_manager():
     return _rag_manager
 
 
-async def _index_and_get_relevant_tools(
-    mcp_toolset: MCPServerStreamableHTTP,
-    task_prompt: str,
-    top_k: int = 100,
-) -> Set[str]:
-    """Index MCP tools (if needed) and get relevant tool names for a task.
-
-    Args:
-        mcp_toolset: The MCP toolset to index
-        task_prompt: The task prompt to find relevant tools for
-        top_k: Number of relevant tools to return
-
-    Returns:
-        Set of relevant tool names
-    """
+async def _get_relevant_tool_names(task_prompt: str) -> Set[str]:
+    """Get relevant tool names via RAG + essential tools."""
     rag_manager = await _get_rag_manager()
 
-    # Index tools (skips if already indexed)
-    await rag_manager.index_toolsets([mcp_toolset])
-
+    # Check if tools are indexed
     stats = rag_manager.get_statistics()
-    logger.info(f"RAG index: {stats.get('total_tools', 0)} tools indexed")
+    if stats.get("total_tools", 0) == 0:
+        logger.warning("No tools indexed in RAG, returning essential tools only")
+        return ESSENTIAL_TOOLS
 
-    # Get relevant tool names
-    relevant_names = await rag_manager.get_relevant_names(task_prompt, top_k=top_k)
-    logger.info(f"RAG filter: {len(relevant_names)} tools relevant for this task")
+    relevant_names = await rag_manager.get_relevant_names(task_prompt, top_k=200)
+    relevant_names = relevant_names | ESSENTIAL_TOOLS
 
+    logger.info(
+        f"Tool filter: {len(relevant_names)} tools selected "
+        f"(RAG: 200 + essential: {len(ESSENTIAL_TOOLS)} with overlap)"
+    )
     return relevant_names
-
-
-def _simplify_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Simplify a JSON schema so Gemini can process it.
-
-    Gemini rejects schemas that are too complex (nested $ref, deep $defs, etc.).
-    This function resolves $ref references inline and limits nesting depth,
-    while preserving top-level property names, types, and descriptions.
-
-    The key improvement over the old sanitize_schema: instead of replacing
-    $ref with "Complex object", we resolve the reference and include the
-    actual property names and types from the referenced definition.
-    """
-    # Extract $defs for inline resolution (check multiple locations)
-    defs = schema.get("$defs", {})
-    if not defs:
-        defs = schema.get("definitions", {})
-
-    def _resolve(s: Any, depth: int = 0, seen: Optional[set] = None) -> Any:
-        if seen is None:
-            seen = set()
-
-        if not isinstance(s, dict):
-            return s
-
-        # Resolve $ref by inlining the referenced definition
-        if "$ref" in s:
-            ref_path = s["$ref"]  # e.g. "#/$defs/SomeType" or "#/definitions/X"
-            ref_name = ref_path.rsplit("/", 1)[-1] if "/" in ref_path else ref_path
-
-            # Prevent infinite recursion on circular refs
-            if ref_name in seen:
-                return {"type": "object"}
-
-            if ref_name in defs:
-                seen = seen | {ref_name}
-                return _resolve(defs[ref_name], depth, seen)
-            else:
-                # $ref not found in $defs — remove it and return generic object
-                return {"type": "object"}
-
-        # At depth > 3, flatten complex nested types to simple objects
-        if depth > 3:
-            schema_type = s.get("type")
-            if schema_type == "object":
-                return {"type": "object"}
-            elif schema_type == "array":
-                return {"type": "array", "items": {"type": "object"}}
-            # For simple types (string, integer, etc.) keep as-is
-            # But strip any remaining $ref or $defs in the value
-            return {
-                k: v for k, v in s.items() if k not in ("$ref", "$defs", "definitions")
-            }
-
-        # Recursively process dict values
-        result = {}
-        for k, v in s.items():
-            if k in ("$defs", "definitions"):
-                continue  # Strip $defs from output (already resolved inline)
-            elif isinstance(v, dict):
-                result[k] = _resolve(v, depth + 1, seen)
-            elif isinstance(v, list):
-                result[k] = [
-                    _resolve(item, depth + 1, seen) if isinstance(item, dict) else item
-                    for item in v
-                ]
-            else:
-                result[k] = v
-
-        return result
-
-    simplified = _resolve(schema)
-
-    # Final safety pass: ensure absolutely no $ref remains anywhere
-    # (Gemini will reject the entire request if even one $ref is undefined)
-    simplified_str = json.dumps(simplified, default=str)
-    if "$ref" in simplified_str:
-        logger.warning(
-            "Schema still contains $ref after simplification, doing aggressive cleanup"
-        )
-        simplified = json.loads(simplified_str.replace('"$ref"', '"_removed_ref"'))
-
-    return simplified
 
 
 async def run_accounting_task(
@@ -235,13 +181,12 @@ async def run_accounting_task(
     file_content: str = "",
     tripletex_credentials: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run the accounting task - single agent with filtered MCP tools.
+    """Run the accounting task with direct OpenAPI tools (no MCP).
 
-    This function:
-    1. Creates MCP toolset connection
-    2. Uses RAG to find relevant tools (embedding search)
-    3. Creates a FilteredToolset that preserves full parameter schemas
-    4. Runs a single agent to execute the task
+    1. Fetch OpenAPI spec (cached)
+    2. RAG filter to select relevant tools
+    3. Generate pydantic-ai Tools from spec
+    4. Run agent with those tools
 
     Args:
         prompt: The accounting task prompt
@@ -253,6 +198,12 @@ async def run_accounting_task(
     """
     logger.info("Starting accounting task execution...")
     credentials = tripletex_credentials or {}
+    base_url = credentials.get("base_url", "")
+    session_token = credentials.get("session_token", "")
+
+    if not base_url or not session_token:
+        logger.error("Missing base_url or session_token!")
+        return {"success": False, "status": "failed", "error": "Missing credentials"}
 
     # Build full prompt with file content
     full_prompt = prompt
@@ -265,75 +216,52 @@ ATTACHED FILE CONTENT:
 Use the information from the attached files above to complete the task."""
         logger.info(f"Added {len(file_content)} chars of file content to prompt")
 
-    # Create MCP toolset
-    mcp_toolset = get_mcp_toolset()
-
     try:
-        # Get relevant tool names via RAG search
-        relevant_names = await _index_and_get_relevant_tools(
-            mcp_toolset, full_prompt, top_k=100
-        )
+        # 1. Get OpenAPI spec (cached)
+        spec = await _get_openapi_spec(base_url, session_token)
 
-        # Create filtered toolset using pydantic-ai's native FilteredToolset
-        # Then apply schema simplification via prepared() so Gemini can handle it.
-        # This resolves $ref inline (preserving property names/types) instead of
-        # replacing them with "Complex object" like the old approach did.
-        from dataclasses import replace as dc_replace
-        from pydantic_ai._run_context import RunContext as PydanticRunContext
+        # 2. Get relevant tool names via RAG
+        relevant_names = await _get_relevant_tool_names(full_prompt)
 
-        async def _simplify_tool_defs(
-            ctx: PydanticRunContext, tool_defs: list[ToolDefinition]
-        ) -> list[ToolDefinition]:
-            simplified = []
-            for td in tool_defs:
-                if td.parameters_json_schema:
-                    new_schema = _simplify_schema_for_gemini(td.parameters_json_schema)
-                    simplified.append(dc_replace(td, parameters_json_schema=new_schema))
-                else:
-                    simplified.append(td)
-            return simplified
-
-        filtered_toolset = mcp_toolset.filtered(
-            lambda ctx, tool_def: tool_def.name in relevant_names
-        ).prepared(_simplify_tool_defs)
-
-        logger.info(
-            f"Created FilteredToolset: {len(relevant_names)} tools "
-            f"(schemas simplified with $ref resolution for Gemini)"
-        )
-
-        # Build the execution prompt with credentials
-        base_url = credentials.get("base_url", "https://api.tripletex.no/v2")
-        session_token = credentials.get("session_token", "")
-
-        execution_prompt = ACCOUNTING_TASK_PROMPT_TEMPLATE.format(
-            task_description=full_prompt,
+        # 3. Generate tools from spec (filtered to relevant ones)
+        tools = generate_tools_from_openapi(
+            spec=spec,
             base_url=base_url,
             session_token=session_token,
+            tool_filter=relevant_names,
         )
 
-        # Create and run the agent
+        if not tools:
+            logger.error("No tools generated from OpenAPI spec!")
+            return {"success": False, "status": "failed", "error": "No tools available"}
+
+        logger.info(f"Generated {len(tools)} direct API tools (no MCP)")
+
+        # 4. Build execution prompt
+        execution_prompt = ACCOUNTING_TASK_PROMPT_TEMPLATE.format(
+            task_description=full_prompt,
+        )
+
+        # 5. Create and run agent
         model = get_google_model()
         agent = Agent(
             model=model,
-            toolsets=[filtered_toolset],
+            tools=tools,
             system_prompt=ACCOUNTING_SYSTEM_INSTRUCTIONS,
             retries=30,
         )
 
-        logger.info("Executing task with agent (full tool schemas preserved)...")
+        logger.info("Executing task with direct API tools...")
         step_num = 0
         try:
-            # Use iter() for step-by-step execution with logging
             async with agent.iter(execution_prompt) as agent_run:
                 async for node in agent_run:
                     step_num += 1
                     node_type = type(node).__name__
                     logger.info(f"[Step {step_num}] {node_type}")
 
-                    # Log tool calls from CallToolsNode
+                    # Log tool calls
                     if isinstance(node, CallToolsNode):
-                        # The node has the model response with tool calls
                         try:
                             resp = getattr(node, "model_response", None)
                             if resp:
@@ -346,12 +274,10 @@ Use the information from the attached files above to complete the task."""
                                             f"[Step {step_num}] TOOL CALL: "
                                             f"{part.tool_name}({args_str})"
                                         )
-                        except Exception as log_err:
-                            logger.debug(
-                                f"[Step {step_num}] Could not log tool call: {log_err}"
-                            )
+                        except Exception:
+                            pass
 
-                    # Log model request nodes (contain tool returns)
+                    # Log tool results and retries
                     if isinstance(node, ModelRequestNode):
                         try:
                             request = getattr(node, "request", None)
@@ -365,25 +291,11 @@ Use the information from the attached files above to complete the task."""
                                         )
                                     elif isinstance(part, RetryPromptPart):
                                         logger.warning(
-                                            f"[Step {step_num}] RETRY: {part.content}"
+                                            f"[Step {step_num}] RETRY: {str(part.content)[:300]}"
                                         )
-                        except Exception as log_err:
-                            logger.debug(
-                                f"[Step {step_num}] Could not log request: {log_err}"
-                            )
+                        except Exception:
+                            pass
 
-                    # Log any node attrs for debugging
-                    try:
-                        node_attrs = [
-                            a
-                            for a in dir(node)
-                            if not a.startswith("_") and a not in ("run",)
-                        ]
-                        logger.debug(f"[Step {step_num}] Node attrs: {node_attrs}")
-                    except Exception:
-                        pass
-
-                # Get final result
                 result = agent_run.result
                 logger.info(f"Agent completed after {step_num} steps")
 
@@ -404,6 +316,7 @@ Use the information from the attached files above to complete the task."""
             report = str(result)
 
         logger.info("Accounting task completed successfully")
+        logger.info(f"Agent final output: {str(report)[:1000]}")
 
         return {
             "success": True,

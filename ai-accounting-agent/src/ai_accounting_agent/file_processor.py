@@ -45,8 +45,10 @@ class FileProcessor:
             # Create temp directory if it doesn't exist
             Path(temp_dir).mkdir(parents=True, exist_ok=True)
 
-            # Save file
+            # Save file - create parent dirs in case filename includes subdirectories
+            # (e.g., "files/tilbudsbrev_nn_08.pdf")
             file_path = Path(temp_dir) / filename
+            file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_bytes(file_bytes)
 
             logger.debug(f"Saved file: {file_path}")

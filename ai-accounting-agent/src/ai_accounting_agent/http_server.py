@@ -127,9 +127,28 @@ async def solve(request: Request):
         )
     await _solve_lock.acquire()
     try:
-        # Parse request
+        # Parse request and log the FULL body for debugging
         body = await request.json()
-        logger.debug(f"[{request_id}] Request body parsed successfully")
+        logger.info(f"[{request_id}] === FULL REQUEST BODY ===")
+        logger.info(f"[{request_id}] Keys: {list(body.keys())}")
+        # Log prompt in full
+        logger.info(f"[{request_id}] prompt: {body.get('prompt', 'MISSING')}")
+        # Log credentials
+        creds = body.get("tripletex_credentials", {})
+        logger.info(
+            f"[{request_id}] tripletex_credentials.base_url: {creds.get('base_url', 'MISSING')}"
+        )
+        logger.info(
+            f"[{request_id}] tripletex_credentials.session_token: {str(creds.get('session_token', 'MISSING'))[:30]}..."
+        )
+        # Log files
+        files_raw = body.get("files", [])
+        logger.info(f"[{request_id}] files count: {len(files_raw)}")
+        for i, f in enumerate(files_raw):
+            logger.info(
+                f"[{request_id}]   file[{i}]: {f.get('filename')} ({f.get('mime_type')}) base64_len={len(f.get('content_base64', ''))}"
+            )
+        logger.info(f"[{request_id}] === END REQUEST BODY ===")
 
         # Validate required fields
         prompt = body.get("prompt")
@@ -199,40 +218,21 @@ async def solve(request: Request):
                     logger.info(
                         f"[{request_id}] ✓ Extracted {len(file_contents)} file(s) content ({len(extracted_file_content)} chars)"
                     )
+                    # Log the actual extracted content so we can verify it
+                    logger.info(
+                        f"[{request_id}] === EXTRACTED FILE CONTENT ===\n{extracted_file_content[:2000]}"
+                    )
+                    logger.info(f"[{request_id}] === END FILE CONTENT ===")
             else:
                 logger.warning(
                     f"[{request_id}] ⚠ File processing failed or returned no content"
                 )
 
-        # Push credentials to MCP server (separate process)
+        # Credentials are passed directly to the coordinator (no MCP server needed)
         if base_url and session_token:
-            try:
-                import httpx
-
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.post(
-                        "http://localhost:8083/update-credentials",
-                        json={
-                            "base_url": base_url,
-                            "session_token": session_token,
-                        },
-                    )
-                    if resp.status_code == 200:
-                        logger.info(
-                            f"[{request_id}] ✓ Pushed credentials to MCP server"
-                        )
-                    else:
-                        logger.warning(
-                            f"[{request_id}] ⚠ MCP credential update returned {resp.status_code}: {resp.text}"
-                        )
-            except Exception as e:
-                logger.warning(
-                    f"[{request_id}] ⚠ Could not push credentials to MCP server: {e}"
-                )
-                # Fall back to env vars (works if same process)
-                os.environ["TRIPLETEX_BASE_URL"] = base_url
-                os.environ["TRIPLETEX_SESSION_TOKEN"] = session_token
-            logger.info(f"[{request_id}] ✓ Configured credentials for this request")
+            logger.info(
+                f"[{request_id}] ✓ Credentials will be used for direct API calls"
+            )
         else:
             logger.warning(
                 f"[{request_id}] ⚠ Missing Tripletex credentials in request!"
@@ -250,7 +250,7 @@ async def solve(request: Request):
                     file_content=extracted_file_content,
                     tripletex_credentials=tripletex_credentials,
                 ),
-                timeout=280.0,  # 280s timeout, 20s buffer before 300s hard limit
+                timeout=300.0,  # 280s timeout, 20s buffer before 300s hard limit
             )
         except asyncio.TimeoutError:
             task_elapsed = asyncio.get_event_loop().time() - task_start
