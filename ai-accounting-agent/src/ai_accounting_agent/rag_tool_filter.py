@@ -580,37 +580,20 @@ class RAGToolFilter(AbstractToolset):
         Raises:
             ValueError: If the tool is not in the relevant set
         """
-        try:
-            relevant_names = await self._get_relevant_tool_names()
+        relevant_names = await self._get_relevant_tool_names()
 
-            if name not in relevant_names:
-                error_msg = (
-                    f"Tool '{name}' is not in the relevant tool set for this task. "
-                    f"Use one of: {', '.join(sorted(relevant_names))}"
-                )
-                logger.warning(error_msg)
-                raise ValueError(error_msg)
-
-            # Delegate to wrapped toolset with correct signature
-            result = await self.wrapped_toolset.call_tool(name, tool_args, ctx, tool)
-            return result
-
-        except ValueError:
-            # Re-raise ValueError as-is (tool not in relevant set)
-            raise
-
-            return result
-
-        except ValueError:
-            # Re-raise ValueError as-is (tool not in relevant set)
-            raise
-        except Exception as e:
-            # For other errors (API errors, validation errors), log as warning and return empty value
-            logger.warning(
-                f"Tool {name} returned error (treating as empty response): {e}"
+        if name not in relevant_names:
+            error_msg = (
+                f"Tool '{name}' is not in the relevant tool set for this task. "
+                f"Use one of: {', '.join(sorted(relevant_names))}"
             )
-            # Return appropriate empty value based on tool return type
-            return "" if tool.return_type == str else {}
+            logger.warning(error_msg)
+            raise ValueError(error_msg)
+
+        # Delegate to wrapped toolset with correct signature
+        # Let all exceptions bubble up so the agent can see error messages
+        result = await self.wrapped_toolset.call_tool(name, tool_args, ctx, tool)
+        return result
 
     def __getattr__(self, name):
         """Delegate all other attributes to the wrapped toolset."""
