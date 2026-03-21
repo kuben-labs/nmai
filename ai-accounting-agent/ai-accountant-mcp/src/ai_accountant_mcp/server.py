@@ -4,13 +4,13 @@ FastMCP Server for Tripletex API v2
 Automatically generates MCP tools from the Tripletex OpenAPI specification.
 All 800+ API endpoints are exposed as callable MCP tools.
 
-Authentication: Session-based from environment variables (.env)
-- Reads SESSION_TOKEN, API_URL, etc. from .env file
-- Automatically adds authorization headers to all requests
-- Coordinator doesn't need to worry about auth - it just calls tools
+DYNAMIC CREDENTIALS SUPPORT:
+This server now supports dynamic credentials per request. Credentials are
+read from environment variables on EACH API call:
+- TRIPLETEX_BASE_URL: API base URL (e.g., https://tx-proxy.ainm.no/v2)
+- TRIPLETEX_SESSION_TOKEN: Session token for authentication
 
-This is the KEY INSIGHT: The MCP handles auth internally.
-Users of the MCP just call tools - they don't deal with credentials.
+If dynamic credentials are not set, falls back to static .env credentials.
 """
 
 import os
@@ -20,23 +20,37 @@ import httpx
 from fastmcp import FastMCP
 from loguru import logger
 from dotenv import load_dotenv
+from typing import Any, Optional
 
 # Load environment variables from .env file
 load_dotenv()
 
 # ============================================================================
-# Configuration from Environment Variables
+# Configuration - Supports Dynamic Overrides
 # ============================================================================
 
-SESSION_TOKEN = os.getenv("SESSION_TOKEN")
-API_URL = os.getenv("API_URL", "https://kkpqfuj-amager.tripletex.dev/v2")
-OPENAPI_URL = f"{API_URL}/openapi.json"
-LOGIN_EMAIL = os.getenv("LOGIN_URL")  # Email address (login)
-WEB_UI = os.getenv("WEB_UI", "https://kkpqfuj-amager.tripletex.dev/")
 
-# ============================================================================
-# Authentication Helper
-# ============================================================================
+def get_credentials():
+    """
+    Get Tripletex credentials, preferring dynamic runtime values.
+
+    This is called on EACH request to allow dynamic credential updates.
+
+    Priority:
+    1. TRIPLETEX_* env vars (set dynamically per request)
+    2. Static .env values (fallback)
+    """
+    # Dynamic credentials (set per-request)
+    base_url = os.getenv("TRIPLETEX_BASE_URL")
+    session_token = os.getenv("TRIPLETEX_SESSION_TOKEN")
+
+    # Fallback to static credentials
+    if not base_url:
+        base_url = os.getenv("API_URL", "https://kkpqfuj-amager.tripletex.dev/v2")
+    if not session_token:
+        session_token = os.getenv("SESSION_TOKEN")
+
+    return base_url, session_token
 
 
 def encode_session_token(token: str) -> str:
@@ -45,19 +59,83 @@ def encode_session_token(token: str) -> str:
 
     Tripletex format: Authorization: Basic base64("0:" + SESSION_TOKEN)
     The username is always "0", password is the session token.
-
-    Args:
-        token: The session token from environment
-
-    Returns:
-        Base64-encoded Basic Auth header value
     """
     if not token:
-        raise ValueError("SESSION_TOKEN not set in .env")
+        raise ValueError("SESSION_TOKEN not set")
 
     credentials = f"0:{token}"
     encoded = base64.b64encode(credentials.encode()).decode()
     return f"Basic {encoded}"
+
+
+# Initial static credentials (for server startup / OpenAPI spec fetch)
+SESSION_TOKEN = os.getenv("SESSION_TOKEN")
+API_URL = os.getenv("API_URL", "https://kkpqfuj-amager.tripletex.dev/v2")
+OPENAPI_URL = f"{API_URL}/openapi.json"
+LOGIN_EMAIL = os.getenv("LOGIN_URL")  # Email address (login)
+WEB_UI = os.getenv("WEB_UI", "https://kkpqfuj-amager.tripletex.dev/")
+
+
+# ============================================================================
+# Dynamic Credentials HTTP Client
+# ============================================================================
+
+
+class DynamicAuthClient(httpx.AsyncClient):
+    """
+    HTTP client that reads credentials on EACH request.
+
+    This allows credentials to be updated via environment variables
+    between requests without restarting the server.
+    """
+
+    def __init__(self, fallback_base_url: str, fallback_token: str, **kwargs):
+        # Set base_url and default auth headers for FastMCP compatibility
+        auth_header = encode_session_token(fallback_token) if fallback_token else ""
+        headers = {"Authorization": auth_header, "Content-Type": "application/json"}
+        super().__init__(
+            base_url=fallback_base_url, timeout=30.0, headers=headers, **kwargs
+        )
+        self._fallback_base_url = fallback_base_url
+        self._fallback_token = fallback_token
+
+    def _get_current_auth(self) -> tuple[str, str]:
+        """Get current credentials from environment."""
+        base_url, token = get_credentials()
+        base_url = base_url or self._fallback_base_url
+        token = token or self._fallback_token
+        return base_url, token
+
+    async def request(self, method: str, url: Any, **kwargs) -> httpx.Response:
+        """Override request to inject dynamic credentials."""
+        base_url, token = self._get_current_auth()
+
+        # Convert URL to string
+        url_str = str(url)
+
+        # If dynamic credentials differ from fallback, update headers
+        if token != self._fallback_token:
+            headers = dict(kwargs.get("headers", {}) or {})
+            headers["Authorization"] = encode_session_token(token)
+            headers["Content-Type"] = "application/json"
+            kwargs["headers"] = headers
+
+        # Check if we need to use a different base URL
+        if (
+            base_url
+            and base_url != self._fallback_base_url
+            and not url_str.startswith("http")
+        ):
+            url_str = f"{base_url.rstrip('/')}/{url_str.lstrip('/')}"
+            # When using full URL, headers from __init__ aren't applied automatically
+            headers = dict(kwargs.get("headers", {}) or {})
+            if "Authorization" not in headers:
+                headers["Authorization"] = encode_session_token(token)
+            headers["Content-Type"] = "application/json"
+            kwargs["headers"] = headers
+
+        logger.debug(f"DynamicAuthClient.request: {method} {url_str[:100]}")
+        return await super().request(method, url_str, **kwargs)
 
 
 # ============================================================================
@@ -66,31 +144,36 @@ def encode_session_token(token: str) -> str:
 
 
 def validate_config():
-    """Validate that all required environment variables are set."""
+    """Validate that all required environment variables are set for startup."""
     errors = []
 
     if not SESSION_TOKEN:
-        errors.append("SESSION_TOKEN not set in .env")
+        errors.append("SESSION_TOKEN not set in .env (needed for startup)")
     if not API_URL:
         errors.append("API_URL not set in .env")
-    if not LOGIN_EMAIL:
-        errors.append("LOGIN_URL (email) not set in .env")
 
     if errors:
-        logger.error("Configuration validation failed:")
+        logger.warning("Configuration warnings:")
         for error in errors:
-            logger.error(f"  ✗ {error}")
-        logger.error("")
-        logger.error("Please set these in ai-accountant-mcp/.env:")
-        logger.error("  SESSION_TOKEN=<your-token>")
-        logger.error("  API_URL=<your-api-url>")
-        logger.error("  LOGIN_URL=<your-email>")
-        raise ValueError("Missing required environment variables")
+            logger.warning(f"  ⚠ {error}")
+        logger.info("")
+        logger.info("Note: Dynamic credentials can be set via TRIPLETEX_* env vars")
+        logger.info("  TRIPLETEX_BASE_URL=<url>")
+        logger.info("  TRIPLETEX_SESSION_TOKEN=<token>")
+        return False
 
     logger.info("✓ Configuration validation passed:")
     logger.info(f"  - API_URL: {API_URL}")
-    logger.info(f"  - LOGIN_EMAIL: {LOGIN_EMAIL}")
-    logger.info(f"  - SESSION_TOKEN: {SESSION_TOKEN[:30]}...{SESSION_TOKEN[-20:]}")
+    if LOGIN_EMAIL:
+        logger.info(f"  - LOGIN_EMAIL: {LOGIN_EMAIL}")
+    if SESSION_TOKEN:
+        token_preview = (
+            SESSION_TOKEN[:20] + "..." + SESSION_TOKEN[-10:]
+            if len(SESSION_TOKEN) > 30
+            else SESSION_TOKEN
+        )
+        logger.info(f"  - SESSION_TOKEN: {token_preview}")
+    return True
 
 
 # ============================================================================
@@ -104,56 +187,68 @@ def create_mcp_server():
 
     Key points:
     1. Validates configuration from .env
-    2. Creates authorization header from SESSION_TOKEN
-    3. Fetches OpenAPI spec from Tripletex (using authenticated request)
-    4. Creates authenticated HTTP client
-    5. Generates MCP tools from all OpenAPI endpoints
-    6. Returns the configured MCP server
+    2. Fetches OpenAPI spec from Tripletex
+    3. Creates DynamicAuthClient that reads credentials per-request
+    4. Generates MCP tools from all OpenAPI endpoints
+    5. Returns the configured MCP server
 
-    The MCP server is now "sealed" - it has credentials baked in.
-    Callers just use the tools without worrying about auth.
+    The DynamicAuthClient will read TRIPLETEX_* env vars on each request,
+    allowing credentials to be updated without restarting the server.
     """
     logger.info("Initializing Tripletex MCP Server...")
     logger.info("")
 
-    # Validate configuration
-    validate_config()
+    # Validate configuration (warnings only, don't fail)
+    has_static_config = validate_config()
     logger.info("")
 
-    # Create authorization header
-    auth_header = encode_session_token(SESSION_TOKEN)
-    logger.info("✓ Authorization header created")
+    # Try to fetch OpenAPI spec
+    openapi_spec = None
 
-    # Fetch OpenAPI spec with authentication
-    logger.info(f"Fetching OpenAPI spec from {OPENAPI_URL}")
-    try:
-        response = httpx.get(
-            OPENAPI_URL, headers={"Authorization": auth_header}, timeout=30.0
+    # First try with static credentials
+    if SESSION_TOKEN and API_URL:
+        auth_header = encode_session_token(SESSION_TOKEN)
+        logger.info(f"Fetching OpenAPI spec from {OPENAPI_URL}")
+        try:
+            response = httpx.get(
+                OPENAPI_URL, headers={"Authorization": auth_header}, timeout=30.0
+            )
+            response.raise_for_status()
+            openapi_spec = response.json()
+            logger.info("✓ OpenAPI spec loaded successfully")
+        except Exception as e:
+            logger.warning(f"⚠ Could not fetch OpenAPI spec: {e}")
+
+    # Try loading from cached file if API fetch failed
+    if openapi_spec is None:
+        cached_spec_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "data", "raw", "openapi.json"
         )
-        response.raise_for_status()
-        openapi_spec = response.json()
-        logger.info(f"✓ OpenAPI spec loaded successfully")
-    except httpx.RequestError as e:
-        logger.error(f"✗ Failed to fetch OpenAPI spec: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"✗ Error loading OpenAPI spec: {e}")
-        raise
+        if os.path.exists(cached_spec_path):
+            logger.info(f"Loading OpenAPI spec from cache: {cached_spec_path}")
+            try:
+                with open(cached_spec_path, "r") as f:
+                    openapi_spec = json.load(f)
+                logger.info("✓ OpenAPI spec loaded from cache")
+            except Exception as e:
+                logger.error(f"✗ Failed to load cached OpenAPI spec: {e}")
+                raise
+        else:
+            raise ValueError(
+                "No OpenAPI spec available (API fetch failed and no cache)"
+            )
 
-    # Create authenticated HTTP client
-    # IMPORTANT: The authorization header is baked into the client
-    # All requests from the MCP tools will automatically use this auth
-    client = httpx.AsyncClient(
-        base_url=API_URL,
-        headers={"Authorization": auth_header},
-        timeout=30.0,
+    # Create dynamic auth client
+    # This client reads credentials from env vars on EACH request
+    client = DynamicAuthClient(
+        fallback_base_url=API_URL or "",
+        fallback_token=SESSION_TOKEN or "",
     )
 
-    logger.info(f"✓ Authenticated HTTP client created")
-    logger.info(f"  Base URL: {API_URL}")
+    logger.info("✓ Dynamic auth HTTP client created")
+    logger.info("  Credentials will be read from env vars on each request")
 
     # Generate MCP from OpenAPI spec
-    # FastMCP will use the authenticated client for all API calls
     logger.info("Generating MCP tools from OpenAPI spec...")
     try:
         mcp = FastMCP.from_openapi(
@@ -227,33 +322,18 @@ def log_startup_info():
     logger.info("╔" + "=" * 78 + "╗")
     logger.info("║ " + "TRIPLETEX MCP SERVER READY".ljust(76) + " ║")
     logger.info("║ " + "=" * 76 + " ║")
-    logger.info(f"║ API URL:       {(API_URL or '').ljust(56)} ║")
-    logger.info(f"║ Web UI:        {(WEB_UI or '').ljust(56)} ║")
-    logger.info(
-        f"║ Auth Status:   ✓ Authenticated ({LOGIN_EMAIL or ''})".ljust(77) + "║"
-    )
+    logger.info(f"║ Fallback URL:  {(API_URL or 'not set').ljust(56)} ║")
+    logger.info(f"║ Web UI:        {(WEB_UI or 'not set').ljust(56)} ║")
     logger.info(f"║ Tools Ready:   ~800 MCP tools available".ljust(77) + "║")
     logger.info(f"║ Listen On:     http://0.0.0.0:8083/mcp".ljust(77) + "║")
     logger.info("║ " + "=" * 76 + " ║")
     logger.info(
-        "║ NOTE: MCP handles authentication internally from .env".ljust(77) + "║"
+        "║ DYNAMIC AUTH: Reads TRIPLETEX_* env vars on each request".ljust(77) + "║"
     )
-    logger.info("║ Callers don't need to worry about credentials.".ljust(77) + "║")
-    logger.info("╚" + "=" * 78 + "╝")
-    logger.info("")
-    logger.info("╔" + "=" * 78 + "╗")
-    logger.info("║ " + "TRIPLETEX MCP SERVER STARTED SUCCESSFULLY".ljust(76) + " ║")
-    logger.info("║ " + "=" * 76 + " ║")
-    logger.info(f"║ API URL:       {API_URL.ljust(56)} ║")
-    logger.info(f"║ Web UI:        {WEB_UI.ljust(56)} ║")
-    logger.info(f"║ Auth Status:   ✓ Authenticated ({LOGIN_EMAIL})".ljust(77) + "║")
-    logger.info(f"║ Tools Ready:   ~800 MCP tools available".ljust(77) + "║")
-    logger.info(f"║ Listen On:     http://0.0.0.0:8083/mcp".ljust(77) + "║")
-    logger.info("║ " + "=" * 76 + " ║")
     logger.info(
-        "║ NOTE: MCP handles authentication internally from .env".ljust(77) + "║"
+        "║ Set TRIPLETEX_BASE_URL and TRIPLETEX_SESSION_TOKEN dynamically".ljust(77)
+        + "║"
     )
-    logger.info("║ Callers don't need to worry about credentials.".ljust(77) + "║")
     logger.info("╚" + "=" * 78 + "╝")
     logger.info("")
 

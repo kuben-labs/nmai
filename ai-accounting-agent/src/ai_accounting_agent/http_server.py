@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from .coordinator import run_accounting_task
 from .file_processor import FileProcessor
+from .tripletex_client import set_tripletex_client, cleanup_tripletex_client
 
 # Load environment variables
 load_dotenv()
@@ -134,6 +135,7 @@ async def solve(request: Request):
 
         # Process attached files if any
         file_data = None
+        extracted_file_content = ""
         if files:
             logger.info(f"[{request_id}] Processing {len(files)} attached files...")
             file_data = FileProcessor.process_files(files)
@@ -141,16 +143,53 @@ async def solve(request: Request):
                 f"[{request_id}] File processing result: {file_data.get('success')}"
             )
 
+            # Extract text content from processed files for the agent
+            if file_data.get("success") and file_data.get("processed_files"):
+                file_contents = []
+                for pf in file_data["processed_files"]:
+                    filename = pf.get("filename", "unknown")
+                    content = pf.get("extracted_text") or pf.get("content", "")
+                    if content:
+                        file_contents.append(
+                            f"--- FILE: {filename} ---\n{content}\n--- END FILE ---"
+                        )
+                if file_contents:
+                    extracted_file_content = "\n\n".join(file_contents)
+                    logger.info(
+                        f"[{request_id}] Extracted {len(file_contents)} file(s) content for agent"
+                    )
+
+        # Set up Tripletex client with per-request credentials
+        base_url = tripletex_credentials.get("base_url", "")
+        session_token = tripletex_credentials.get("session_token", "")
+
+        if base_url and session_token:
+            # Set dynamic credentials for this request
+            set_tripletex_client(base_url, session_token)
+            # Also set environment variables for MCP server if it checks them
+            os.environ["TRIPLETEX_BASE_URL"] = base_url
+            os.environ["TRIPLETEX_SESSION_TOKEN"] = session_token
+            logger.info(
+                f"[{request_id}] Configured Tripletex client with request credentials"
+            )
+        else:
+            logger.warning(f"[{request_id}] Missing Tripletex credentials in request!")
+
         # Run the accounting task workflow
         logger.info(f"[{request_id}] Starting accounting task workflow...")
         task_start = asyncio.get_event_loop().time()
 
         result = await run_accounting_task(
-            prompt=prompt, files=files, tripletex_credentials=tripletex_credentials
+            prompt=prompt,
+            file_content=extracted_file_content,
+            tripletex_credentials=tripletex_credentials,
         )
 
         task_elapsed = asyncio.get_event_loop().time() - task_start
         logger.info(f"[{request_id}] Task workflow completed in {task_elapsed:.2f}s")
+
+        # Clean up client
+        await cleanup_tripletex_client()
 
         # Check if successful
         if result.get("success"):

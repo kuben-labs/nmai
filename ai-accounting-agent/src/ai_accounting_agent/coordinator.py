@@ -36,7 +36,7 @@ class AccountingSubAgent(BaseAgent):
             tripletex_credentials: Tripletex API credentials (base_url, session_token)
         """
         # Extract credentials for inclusion in prompt
-        # NOTE: These are for transparency; actual API calls use MCP server's .env credentials
+        # These credentials are used by the TripletexClient for actual API calls
         base_url = (tripletex_credentials or {}).get(
             "base_url", "https://api.tripletex.no/v2"
         )
@@ -239,10 +239,7 @@ class CoordinatorAgent(BaseAgent):
                 await self._initialize_rag_filtering()
 
             # Create the prompt for execution with credentials
-            # NOTE: These credentials are informational - the actual API calls use
-            # credentials from the MCP server's .env file, not these values.
-            # The LLM cannot use these credentials directly; they're provided for
-            # transparency and future extensibility.
+            # Credentials are set in the TripletexClient and environment for MCP
             base_url = self.tripletex_credentials.get(
                 "base_url", "https://api.tripletex.no/v2"
             )
@@ -352,7 +349,7 @@ Completed
 
 async def run_accounting_task(
     prompt: str,
-    files: list = None,
+    file_content: str = "",
     tripletex_credentials: dict = None,
 ) -> Dict[str, Any]:
     """
@@ -365,8 +362,8 @@ async def run_accounting_task(
 
     Args:
         prompt: The accounting task prompt
-        files: Optional list of attached files
-        tripletex_credentials: Tripletex API credentials
+        file_content: Extracted content from attached files (PDF text, OCR, etc.)
+        tripletex_credentials: Tripletex API credentials (base_url, session_token)
 
     Returns:
         Dictionary with task results
@@ -374,19 +371,30 @@ async def run_accounting_task(
     logger.info("Starting simplified accounting task workflow...")
 
     try:
+        # Build complete task context including file content
+        full_prompt = prompt
+        if file_content:
+            full_prompt = f"""{prompt}
+
+ATTACHED FILE CONTENT:
+{file_content}
+
+Use the information from the attached files above to complete the task."""
+            logger.info(f"Added {len(file_content)} chars of file content to prompt")
+
         # Single step: Execute the task directly
         logger.info("Executing task directly with main agent...")
 
         # Create main agent to execute the task
         coordinator = CoordinatorAgent(
-            task_summary=prompt,
+            task_summary=full_prompt,
             task_type="Direct",
             complexity="single",
             subtasks=[
                 {
                     "id": "main",
                     "title": "Execute Task",
-                    "description": prompt,
+                    "description": full_prompt,
                     "dependencies": None,
                 }
             ],

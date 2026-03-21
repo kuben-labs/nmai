@@ -35,11 +35,14 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "$(GREEN)%-25s$(NC) %s\n", $$1, $$2}'
 
 # Development commands
-dev: dev-all ## Start all services (alias for dev-all)
+dev-all: kill-ports ## Start all services (MCP + Agent) in parallel
+	@echo "$(YELLOW)Starting all services in parallel...$(NC)"
+	@trap 'kill 0' INT; \
+	(cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py) & \
+	sleep 3 && uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --reload & \
+	wait
 
-dev: ## Start all services in development mode
-	@echo "$(YELLOW)Starting all services...$(NC)"
-	@$(MAKE) -j3 kill-ports dev-mcp dev-agent
+dev: dev-all ## Start all services (alias for dev-all)
 
 
 kill-ports: ## Free development ports (8080, 8083)
