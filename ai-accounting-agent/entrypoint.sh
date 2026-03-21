@@ -7,7 +7,7 @@ cd /app/ai-accountant-mcp && python src/ai_accountant_mcp/server.py &
 MCP_PID=$!
 
 # Give MCP server time to start
-sleep 2
+sleep 10
 
 # Start Agent server in the foreground
 echo "Starting Agent server..."

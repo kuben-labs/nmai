@@ -56,11 +56,11 @@ kill-ports: ## Free development ports (8080, 8083)
 
 dev-mcp: ## Start MCP server only
 	@echo "$(BLUE)Starting MCP server on $(MCP_URL)...$(NC)"
-	@cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py
+	@cd ai-accountant-mcp && uv run python src/ai_accountant_mcp/server.py && sleep 5
 
 dev-agent: ## Start Agent server only
 	@echo "$(BLUE)Starting Agent server on $(AGENT_URL)...$(NC)"
-	@uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --reload
+	@sleep 5 && uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --reload
 
 dev-cli: ## Start CLI mode for testing agents locally
 	@echo "$(BLUE)Starting Agent CLI mode...$(NC)"
