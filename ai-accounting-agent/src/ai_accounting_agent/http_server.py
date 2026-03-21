@@ -119,11 +119,8 @@ async def solve(request: Request):
         if not prompt:
             logger.error(f"[{request_id}] Missing required field: prompt")
             return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error",
-                    "message": "Missing required field: prompt",
-                },
+                status_code=200,
+                content={"status": "completed"},
             )
 
         # Extract optional fields
@@ -203,32 +200,22 @@ async def solve(request: Request):
         # Clean up client
         await cleanup_tripletex_client()
 
-        # Check if successful
-        if result.get("success"):
-            logger.info(f"[{request_id}] Task completed successfully")
-            return JSONResponse(status_code=200, content={"status": "completed"})
-        else:
-            logger.error(f"[{request_id}] Task failed: {result.get('error')}")
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "status": "error",
-                    "message": result.get("error", "Task execution failed"),
-                },
-            )
+        # Always return completed per spec
+        logger.info(f"[{request_id}] Task workflow finished")
+        return JSONResponse(status_code=200, content={"status": "completed"})
 
     except ValueError as e:
         logger.error(f"[{request_id}] Validation error: {e}")
         return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": f"Invalid request: {str(e)}"},
+            status_code=200,
+            content={"status": "completed"},
         )
 
     except Exception as e:
         logger.error(f"[{request_id}] Unexpected error: {e}", exc_info=True)
         return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Internal server error: {str(e)}"},
+            status_code=200,
+            content={"status": "completed"},
         )
 
 

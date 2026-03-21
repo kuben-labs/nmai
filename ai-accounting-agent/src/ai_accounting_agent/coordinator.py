@@ -58,12 +58,14 @@ def load_mcp_config(config_path: str = "mcp_accountant.json") -> List[Dict[str, 
 def setup_mcp_toolsets(
     server_configs: List[Dict[str, Any]],
     timeout: float = 300.0,
+    max_retries: int = 30,
 ) -> List[MCPServerStreamableHTTP]:
     """Set up MCP toolsets from server configurations.
 
     Args:
         server_configs: List of server configurations
         timeout: Timeout for MCP connections in seconds
+        max_retries: Maximum number of tool retries
 
     Returns:
         List of configured MCP toolsets
@@ -79,6 +81,7 @@ def setup_mcp_toolsets(
                 server = MCPServerStreamableHTTP(
                     url=url,
                     timeout=timeout,
+                    max_retries=max_retries,
                 )
                 toolsets.append(server)
                 logger.info(f"Added {server_type} MCP server: {url}")
@@ -146,7 +149,7 @@ class AccountingSubAgent:
             model=self.model,
             toolsets=self.toolsets,
             system_prompt=ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
-            retries=3,
+            retries=30,
         )
 
         logger.info(
@@ -242,7 +245,7 @@ class AccountingSubAgent:
                     model=self.model,
                     toolsets=filtered_toolsets,
                     system_prompt=ACCOUNTING_SUBAGENT_SYSTEM_INSTRUCTIONS,
-                    retries=3,
+                    retries=30,
                 )
 
                 logger.info(
@@ -308,7 +311,7 @@ class CoordinatorAgent:
             model=self.model,
             toolsets=self.toolsets,
             system_prompt=ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
-            retries=3,
+            retries=30,
         )
 
         logger.info(f"Coordinator initialized with {len(self.toolsets)} toolset(s)")
@@ -419,7 +422,7 @@ Completed
                     model=self.model,
                     toolsets=filtered_toolsets,
                     system_prompt=ACCOUNTING_COORDINATOR_SYSTEM_INSTRUCTIONS,
-                    retries=3,
+                    retries=30,
                 )
 
                 logger.info(
