@@ -133,10 +133,10 @@ def extract_file_content(files: list) -> str:
 
 
 def build_user_message(prompt: str, files: list) -> list:
-    """Build the user message content blocks, including images for vision."""
+    """Build the user message content blocks, including images and PDFs for vision."""
     content_blocks = []
 
-    # Add any image files as vision content
+    # Add files as native content blocks (vision/document)
     for f in files:
         mime_type = f.get("mime_type", "")
         if mime_type and mime_type.startswith("image/"):
@@ -145,6 +145,15 @@ def build_user_message(prompt: str, files: list) -> list:
                 "source": {
                     "type": "base64",
                     "media_type": mime_type,
+                    "data": f["content_base64"],
+                }
+            })
+        elif mime_type == "application/pdf":
+            content_blocks.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
                     "data": f["content_base64"],
                 }
             })

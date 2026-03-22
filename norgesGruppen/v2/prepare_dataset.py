@@ -6,6 +6,7 @@ Improvements over v1:
   - Higher overlap (30%) to reduce missed annotations at tile edges
   - Stratified train/val split ensuring rare categories appear in both
   - Optional negative tiles (empty) to reduce false positives
+  - Class balancing via oversampling (--balance)
 
 Output:
     dataset_tiled/images/train/   (full images + tiles)
@@ -17,13 +18,15 @@ Output:
 Usage:
     python prepare_dataset.py
     python prepare_dataset.py --tile-sizes 1280,960 --overlap 0.3
+    python prepare_dataset.py --balance median
 """
 
 import argparse
 import json
+import os
 import random
 import shutil
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from PIL import Image
@@ -155,10 +158,16 @@ def parse_args():
     p.add_argument("--overlap", type=float, default=0.3,
                    help="Tile overlap ratio (default: 0.3)")
     p.add_argument("--out", type=str, default=str(OUT_DIR))
+    p.add_argument("--coco-dir", type=str, default=str(COCO_DIR),
+                   help="Path to COCO dataset dir (default: coco/train)")
     p.add_argument("--include-negatives", action="store_true",
                    help="Include some empty tiles as negative examples")
     p.add_argument("--neg-ratio", type=float, default=0.05,
                    help="Ratio of negative tiles to keep (default: 0.05)")
+    p.add_argument("--balance", default=None,
+                   help="Oversample rare classes. Target: 'median', 'p75', or integer count")
+    p.add_argument("--max-oversampled", type=int, default=5000,
+                   help="Max total train images after oversampling (default: 5000)")
     return p.parse_args()
 
 
@@ -168,8 +177,9 @@ def main():
     overlap = args.overlap
     out_dir = Path(args.out)
 
-    raw_images = COCO_DIR / "images"
-    ann_path = COCO_DIR / "annotations.json"
+    coco_dir = Path(args.coco_dir)
+    raw_images = coco_dir / "images"
+    ann_path = coco_dir / "annotations.json"
 
     print(f"Reading annotations from {ann_path} ...")
     with open(ann_path) as f:
@@ -207,7 +217,9 @@ def main():
         img_out.mkdir(parents=True, exist_ok=True)
         lbl_out.mkdir(parents=True, exist_ok=True)
 
-        for img_id in sorted(ids):
+        for idx, img_id in enumerate(sorted(ids)):
+            if idx % 50 == 0:
+                print(f"  {split}: {idx}/{len(ids)} images processed ...")
             img = img_info[img_id]
             src_path = raw_images / img["file_name"]
             stem = Path(img["file_name"]).stem
@@ -265,6 +277,101 @@ def main():
 
             if pil_img is not None:
                 pil_img.close()
+
+    # ── Class balancing via oversampling ─────────────────────────────
+    if args.balance:
+        img_out = out_dir / "images" / "train"
+        lbl_out = out_dir / "labels" / "train"
+
+        # Collect all train label files and their class counts
+        train_labels = sorted(lbl_out.glob("*.txt"))
+        file_classes = {}  # filename_stem -> list of category_ids
+        cat_counts = Counter()
+        for lbl_path in train_labels:
+            cats = []
+            for line in lbl_path.read_text().strip().split("\n"):
+                if line.strip():
+                    cat_id = int(line.split()[0])
+                    cats.append(cat_id)
+                    cat_counts[cat_id] += 1
+            file_classes[lbl_path.stem] = cats
+
+        # Determine target
+        counts = sorted(cat_counts.values())
+        if args.balance == "median":
+            target = counts[len(counts) // 2]
+        elif args.balance == "p75":
+            target = counts[int(len(counts) * 0.75)]
+        else:
+            target = int(args.balance)
+
+        below = {cid: target - cnt for cid, cnt in cat_counts.items() if cnt < target}
+        print(f"\nOversampling: target={target}, {len(below)} categories below target")
+
+        # For each file, count how many instances of each below-target class it has
+        file_rare_counts = {}
+        for stem, cats in file_classes.items():
+            rare_count = sum(1 for c in cats if c in below)
+            if rare_count > 0:
+                file_rare_counts[stem] = Counter(c for c in cats if c in below)
+
+        dup_id = 0
+        n_oversampled = 0
+        max_dup = args.max_oversampled - len(train_labels)
+
+        while below and n_oversampled < max_dup:
+            # Pick the rarest category
+            rarest = min(below, key=lambda c: cat_counts[c])
+
+            # Find the file with the most instances of this category
+            best_stem = None
+            best_count = 0
+            for stem, rare_cc in file_rare_counts.items():
+                if rare_cc.get(rarest, 0) > best_count:
+                    best_count = rare_cc[rarest]
+                    best_stem = stem
+
+            if best_stem is None or best_count == 0:
+                del below[rarest]
+                continue
+
+            # How many copies needed
+            n_copies = min(
+                (below[rarest] + best_count - 1) // best_count,
+                max_dup - n_oversampled,
+            )
+
+            src_img_candidates = [
+                p for p in img_out.iterdir()
+                if p.stem == best_stem and p.suffix in ('.jpg', '.jpeg', '.png')
+            ]
+            if not src_img_candidates:
+                del below[rarest]
+                continue
+
+            src_img_path = src_img_candidates[0]
+            src_lbl_path = lbl_out / f"{best_stem}.txt"
+
+            for i in range(n_copies):
+                dup_id += 1
+                dup_stem = f"{best_stem}_os{dup_id}"
+                # Symlink image, copy label
+                dst_img = img_out / f"{dup_stem}{src_img_path.suffix}"
+                dst_lbl = lbl_out / f"{dup_stem}.txt"
+                os.symlink(src_img_path.resolve(), dst_img)
+                shutil.copy2(src_lbl_path, dst_lbl)
+                n_oversampled += 1
+
+            # Update counts
+            for cat_id in file_classes[best_stem]:
+                cat_counts[cat_id] += n_copies
+            below = {cid: target - cnt for cid, cnt in cat_counts.items() if cnt < target}
+
+        new_total = len(train_labels) + n_oversampled
+        print(f"  Added {n_oversampled} oversampled images (symlinks)")
+        print(f"  Total train images: {new_total}")
+        new_counts = sorted(cat_counts.values())
+        print(f"  Min/Median/Max class counts: {new_counts[0]} / {new_counts[len(new_counts)//2]} / {new_counts[-1]}")
 
     # Write dataset.yaml
     class_names = [cat["name"] for cat in coco["categories"]]

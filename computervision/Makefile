@@ -41,6 +41,12 @@ train:
 train-parallel:
 	bash train_parallel.sh
 
+resume:
+	python3 resume.py --weights $(RESUME_FROM)
+
+find-weights:
+	find runs -name 'best.pt' -o -name 'last.pt' | sort
+
 compare:
 	python3 compare_runs.py
 
@@ -49,7 +55,7 @@ all: install prepare train
 
 # ---- Submission (run on VM after training) ----
 # Set WEIGHTS to the actual best.pt path printed after training
-WEIGHTS=runs/multiclass/weights/best.pt
+WEIGHTS=runs/detect/runs/exp_11x_1280/weights/best.pt
 
 export-onnx:
 	python3 export_onnx.py --weights $(WEIGHTS)

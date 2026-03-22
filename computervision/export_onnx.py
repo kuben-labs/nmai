@@ -6,7 +6,7 @@ from ultralytics import YOLO
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", default="runs/multiclass/weights/best.pt")
+    parser.add_argument("--weights", default="runs/detect/runs/exp_11x_1280/weights/best.pt")
     parser.add_argument("--imgsz", type=int, default=1280)
     args = parser.parse_args()
 

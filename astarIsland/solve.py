@@ -17,7 +17,7 @@ import numpy as np
 import requests
 from pathlib import Path
 from collections import defaultdict
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, ExtraTreesRegressor
 
 BASE_URL = "https://api.ainm.no"
 CACHE_DIR = Path(__file__).parent / ".cache"
@@ -281,19 +281,24 @@ def study_round(session, round_info):
     for key, data in groups.items():
         table[key] = np.mean(data["probs"], axis=0).tolist()
 
-    # Compute activity signature
-    sig = {
-        "settl_survival": settl_alive / max(settl_total, 1),
-        "expansion_rate": expansion_cells / max(expansion_total, 1),
-        "forest_survival": forest_stayed / max(forest_total, 1),
-    }
-
     # Compute decay profile (expansion rate at each distance)
     decay = {}
     for d in sorted(expansion_by_dist.keys()):
         data = expansion_by_dist[d]
         if data["total"] > 0:
             decay[str(d)] = data["expanded"] / data["total"]
+
+    # Compute activity signature (including decay steepness)
+    d1_val = decay.get("1", 0.0)
+    d3_val = decay.get("3", 0.001)
+    decay_steepness = d1_val / (d3_val + 0.001)  # high = sharp decay
+
+    sig = {
+        "settl_survival": settl_alive / max(settl_total, 1),
+        "expansion_rate": expansion_cells / max(expansion_total, 1),
+        "forest_survival": forest_stayed / max(forest_total, 1),
+        "decay_steepness": decay_steepness,
+    }
 
     result = {
         "round_number": rn,
@@ -306,7 +311,8 @@ def study_round(session, round_info):
     print(f"  Round {rn}: {result['n_cells']} cells, "
           f"settl_surv={sig['settl_survival']:.3f} "
           f"expansion={sig['expansion_rate']:.3f} "
-          f"forest_surv={sig['forest_survival']:.3f}")
+          f"forest_surv={sig['forest_survival']:.3f} "
+          f"decay_steep={decay_steepness:.1f}")
     return result
 
 
@@ -382,12 +388,6 @@ def estimate_activity_from_observations(observations, initial_states, seeds_coun
                         if obs_cls == 4:
                             forest_stayed += 1
 
-    sig = {
-        "settl_survival": settl_alive / max(settl_total, 1),
-        "expansion_rate": expansion / max(expansion_total, 1),
-        "forest_survival": forest_stayed / max(forest_total, 1),
-    }
-
     # Per-distance decay profile from observations
     decay_profile = {}
     for d in range(10):
@@ -396,6 +396,17 @@ def estimate_activity_from_observations(observations, initial_states, seeds_coun
             decay_profile[d] = data["expanded"] / data["total"]
         else:
             decay_profile[d] = 0
+
+    d1_val = decay_profile.get(1, 0.0)
+    d3_val = decay_profile.get(3, 0.001)
+    decay_steepness = d1_val / (d3_val + 0.001)
+
+    sig = {
+        "settl_survival": settl_alive / max(settl_total, 1),
+        "expansion_rate": expansion / max(expansion_total, 1),
+        "forest_survival": forest_stayed / max(forest_total, 1),
+        "decay_steepness": decay_steepness,
+    }
     sig["observed_decay"] = decay_profile
 
     return sig
@@ -406,14 +417,20 @@ def match_rounds(observed_sig, round_data, bandwidth=0.20):
     Gaussian kernel-weighted matching: all rounds contribute,
     weighted by similarity to observed activity signature.
     bandwidth=0.20 tested optimal with decay scaling active.
+    Now includes decay_steepness as a 4th matching dimension.
     """
+    # Normalize decay_steepness to comparable scale (log scale, capped)
+    obs_steep = np.log1p(min(observed_sig.get("decay_steepness", 5.0), 100.0))
+
     weights = []
     for rd in round_data:
         sig = rd["signature"]
+        rd_steep = np.log1p(min(sig.get("decay_steepness", 5.0), 100.0))
         d2 = (
             3.0 * (sig["settl_survival"] - observed_sig["settl_survival"]) ** 2
             + 2.0 * (sig["expansion_rate"] - observed_sig["expansion_rate"]) ** 2
             + 1.0 * (sig["forest_survival"] - observed_sig["forest_survival"]) ** 2
+            + 1.5 * ((rd_steep - obs_steep) / 3.0) ** 2
         )
         w = np.exp(-d2 / (2 * bandwidth ** 2))
         weights.append((rd, w))
@@ -470,20 +487,24 @@ def get_blended_decay(matched_rounds):
 
 def compute_features_for_cell(terrain, dist, coastal, adj_forest, adj_mountain,
                                adj_ocean, adj_settl, n_settl_d2, n_settl_d4, n_settl_d6,
-                               sig, decay_profile):
-    """Compute 22-dim feature vector for a single cell."""
-    # Terrain one-hot (4 dims)
+                               sig, decay_profile,
+                               x_norm=0.0, y_norm=0.0, n_total_settl=0.0,
+                               ocean_ratio=0.0, forest_ratio=0.0,
+                               dist_to_port=15.0, adj_ruin=0):
+    """Compute feature vector for a single cell."""
+    # Terrain one-hot (5 dims)
     is_settlement = 1.0 if terrain in (SETTLEMENT, PORT) else 0.0
     is_port = 1.0 if terrain == PORT else 0.0
     is_forest = 1.0 if terrain == FOREST else 0.0
     is_empty = 1.0 if terrain in (EMPTY, PLAINS) else 0.0
+    is_ruin = 1.0 if terrain == RUIN else 0.0
 
-    # Spatial (7 dims)
+    # Spatial (5 dims)
     d_norm = min(dist, 15) / 15.0
     coastal_f = 1.0 if coastal else 0.0
-    nearest_port_f = 0.0  # simplified — not tracked per cell
+    dist_inv = 1.0 / (1.0 + dist)
+    port_d_norm = min(dist_to_port, 15) / 15.0
 
-    # Adjacency (4 dims) — already passed
     # Round-level (7 dims)
     settl_surv = sig.get("settl_survival", 0.3)
     exp_rate = sig.get("expansion_rate", 0.05)
@@ -494,13 +515,22 @@ def compute_features_for_cell(terrain, dist, coastal, adj_forest, adj_mountain,
     d4 = decay_profile.get(4, decay_profile.get("4", 0.0))
     d5 = decay_profile.get(5, decay_profile.get("5", 0.0))
 
+    # Derived features (3 dims)
+    decay_ratio = d1 / (d2 + 0.001)  # steepness of expansion decay
+    # Expected expansion probability at this cell's distance
+    dd = min(int(dist), 8)
+    expansion_at_d = decay_profile.get(dd, decay_profile.get(str(dd), 0.0))
+
     return [
-        is_settlement, is_port, is_forest, is_empty,
-        d_norm, coastal_f, nearest_port_f,
+        is_settlement, is_port, is_forest, is_empty, is_ruin,
+        d_norm, coastal_f, dist_inv, port_d_norm,
+        x_norm, y_norm,
         n_settl_d2, n_settl_d4, n_settl_d6,
-        adj_forest, adj_mountain, adj_ocean, adj_settl,
+        adj_forest, adj_mountain, adj_ocean, adj_settl, adj_ruin,
+        n_total_settl, ocean_ratio, forest_ratio,
         settl_surv, exp_rate, forest_surv,
         d1, d2, d3, d4, d5,
+        decay_ratio, expansion_at_d,
     ]
 
 
@@ -510,14 +540,16 @@ def compute_cell_maps(init_grid_np, settlements, height, width):
     coastal_map = is_coastal_map(init_grid_np)
     forest_adj = adj_forest_map(init_grid_np)
 
-    # Adjacent mountain/ocean/settlement counts
+    # Adjacent terrain counts
     mountain_mask = (init_grid_np == MOUNTAIN).astype(np.int8)
     ocean_mask = (init_grid_np == OCEAN).astype(np.int8)
     settl_mask = ((init_grid_np == SETTLEMENT) | (init_grid_np == PORT)).astype(np.int8)
+    ruin_mask = (init_grid_np == RUIN).astype(np.int8)
 
     adj_mtn = np.zeros((height, width), dtype=np.int8)
     adj_ocn = np.zeros((height, width), dtype=np.int8)
     adj_stl = np.zeros((height, width), dtype=np.int8)
+    adj_ruin = np.zeros((height, width), dtype=np.int8)
     for dy in [-1, 0, 1]:
         for dx in [-1, 0, 1]:
             if dy == 0 and dx == 0:
@@ -525,6 +557,7 @@ def compute_cell_maps(init_grid_np, settlements, height, width):
             adj_mtn += np.roll(np.roll(mountain_mask, dy, axis=0), dx, axis=1)
             adj_ocn += np.roll(np.roll(ocean_mask, dy, axis=0), dx, axis=1)
             adj_stl += np.roll(np.roll(settl_mask, dy, axis=0), dx, axis=1)
+            adj_ruin += np.roll(np.roll(ruin_mask, dy, axis=0), dx, axis=1)
 
     # Settlement counts within radius 2, 4, 6
     n_d2 = np.zeros((height, width), dtype=np.float32)
@@ -541,13 +574,31 @@ def compute_cell_maps(init_grid_np, settlements, height, width):
                 if d <= 6:
                     n_d6[y, x] += 1
 
-    return dist_map, coastal_map, forest_adj, adj_mtn, adj_ocn, adj_stl, n_d2, n_d4, n_d6
+    # Distance to nearest port
+    ports = [(sx, sy) for sx, sy, hp in settlements if hp]
+    dist_to_port = np.full((height, width), 999, dtype=np.int16)
+    for px, py in ports:
+        for y in range(height):
+            for x in range(width):
+                d = max(abs(x - px), abs(y - py))
+                if d < dist_to_port[y, x]:
+                    dist_to_port[y, x] = d
+
+    # Map-level stats
+    total_cells = height * width
+    n_total_settl = float(len(settlements))
+    ocean_ratio = float(np.sum(init_grid_np == OCEAN)) / total_cells
+    forest_ratio = float(np.sum(init_grid_np == FOREST)) / total_cells
+
+    return (dist_map, coastal_map, forest_adj, adj_mtn, adj_ocn, adj_stl, adj_ruin,
+            n_d2, n_d4, n_d6, dist_to_port, n_total_settl, ocean_ratio, forest_ratio)
 
 
 def build_features_grid(init_grid_np, settlements, height, width, sig, decay_profile):
     """Build feature matrix for all non-static cells."""
     maps = compute_cell_maps(init_grid_np, settlements, height, width)
-    dist_map, coastal_map, forest_adj, adj_mtn, adj_ocn, adj_stl, n_d2, n_d4, n_d6 = maps
+    (dist_map, coastal_map, forest_adj, adj_mtn, adj_ocn, adj_stl, adj_ruin,
+     n_d2, n_d4, n_d6, dist_to_port, n_total_settl, ocean_ratio, forest_ratio) = maps
 
     features = []
     coords = []
@@ -562,6 +613,11 @@ def build_features_grid(init_grid_np, settlements, height, width, sig, decay_pro
                 int(adj_ocn[y, x]), int(adj_stl[y, x]),
                 float(n_d2[y, x]), float(n_d4[y, x]), float(n_d6[y, x]),
                 sig, decay_profile,
+                x_norm=x / width, y_norm=y / height,
+                n_total_settl=n_total_settl, ocean_ratio=ocean_ratio,
+                forest_ratio=forest_ratio,
+                dist_to_port=int(dist_to_port[y, x]),
+                adj_ruin=int(adj_ruin[y, x]),
             )
             features.append(feat)
             coords.append((y, x))
@@ -639,8 +695,21 @@ def train_hgbr_models(X, y):
     return models
 
 
-def predict_hgbr(models, X):
-    """Predict probabilities using HGBR models. Returns (n_samples, 6) array."""
+def train_rf_models(X, y):
+    """Train one ExtraTrees model per class. Returns list of 6 models."""
+    models = []
+    for c in range(N_CLASSES):
+        model = ExtraTreesRegressor(
+            n_estimators=200, max_depth=12, min_samples_leaf=10,
+            random_state=42, n_jobs=-1,
+        )
+        model.fit(X, y[:, c])
+        models.append(model)
+    return models
+
+
+def predict_ml(models, X):
+    """Predict probabilities using ML models. Returns (n_samples, 6) array."""
     preds = np.column_stack([m.predict(X) for m in models])
     preds = np.maximum(preds, PROB_FLOOR)
     preds /= preds.sum(axis=1, keepdims=True)
@@ -653,7 +722,8 @@ def predict_hgbr(models, X):
 
 def build_prediction(initial_grid_np, settlements, obs_list, height, width,
                      matched_rounds, prior_strength=15.0, target_decay=None,
-                     observed_sig=None, hgbr_models=None, ensemble_alpha=0.5):
+                     observed_sig=None, hgbr_models=None, rf_models=None,
+                     ensemble_alpha=0.5):
     """
     Build H×W×6 prediction using matched round priors + observations.
     If target_decay is provided, rescale settlement probabilities per distance
@@ -741,29 +811,71 @@ def build_prediction(initial_grid_np, settlements, obs_list, height, width,
                         prior = np.maximum(prior, 0)
                         prior /= prior.sum()
 
+                # Store lookup prior (before Dirichlet), apply Dirichlet later
+                prediction[y, x] = prior
 
-                alpha = prior * prior_strength
-
-                if obs_total[y, x] > 0:
-                    # Dirichlet posterior: prior + observed counts
-                    posterior = alpha + obs_counts[y, x]
-                    prediction[y, x] = posterior / posterior.sum()
-                else:
-                    # Use prior directly
-                    prediction[y, x] = prior
-
-    # Ensemble: blend lookup prediction with HGBR
-    if hgbr_models is not None and observed_sig is not None:
+    # Ensemble: blend lookup prediction with ML models
+    if (hgbr_models is not None or rf_models is not None) and observed_sig is not None:
         decay_for_feat = target_decay if target_decay else {}
         sig_for_feat = observed_sig if observed_sig else {"settl_survival": 0.3, "expansion_rate": 0.05, "forest_survival": 0.8}
         X, coords = build_features_grid(initial_grid_np, settlements, height, width, sig_for_feat, decay_for_feat)
         if len(X) > 0:
-            hgbr_preds = predict_hgbr(hgbr_models, X)
-            for i, (y, x) in enumerate(coords):
-                lookup_pred = prediction[y, x]
-                ml_pred = hgbr_preds[i]
-                # Blend: alpha * lookup + (1-alpha) * HGBR
-                prediction[y, x] = ensemble_alpha * lookup_pred + (1 - ensemble_alpha) * ml_pred
+            if hgbr_models is not None and rf_models is not None:
+                # Triple ensemble: 0.4 lookup + 0.3 HGBR + 0.3 RF
+                hgbr_preds = predict_ml(hgbr_models, X)
+                rf_preds = predict_ml(rf_models, X)
+                for i, (y, x) in enumerate(coords):
+                    prediction[y, x] = (0.4 * prediction[y, x]
+                                        + 0.3 * hgbr_preds[i]
+                                        + 0.3 * rf_preds[i])
+            elif hgbr_models is not None:
+                # Dual ensemble: alpha * lookup + (1-alpha) * HGBR
+                hgbr_preds = predict_ml(hgbr_models, X)
+                for i, (y, x) in enumerate(coords):
+                    prediction[y, x] = (ensemble_alpha * prediction[y, x]
+                                        + (1 - ensemble_alpha) * hgbr_preds[i])
+
+    # ── Observation-based calibration ──
+    # Compare model predictions on observed cells vs observations,
+    # then adjust all predictions to correct systematic bias
+    has_obs = obs_total > 0
+    n_obs_cells = int(has_obs.sum())
+    if n_obs_cells >= 20:
+        # Compute observed class frequencies on dynamic observed cells
+        dynamic_obs_mask = has_obs & ~np.isin(initial_grid_np, list(STATIC_TERRAINS))
+        n_dynamic_obs = int(dynamic_obs_mask.sum())
+        if n_dynamic_obs >= 20:
+            pred_on_obs = prediction[dynamic_obs_mask]  # (n, 6)
+            obs_freq = (obs_counts[dynamic_obs_mask] /
+                        obs_total[dynamic_obs_mask, np.newaxis])  # (n, 6)
+
+            # Per-class mean: predicted vs observed
+            pred_mean = pred_on_obs.mean(axis=0)
+            obs_mean = obs_freq.mean(axis=0)
+
+            # Compute calibration factors for classes 1-4 (skip 0=empty, 5=mountain)
+            cal_factors = np.ones(N_CLASSES)
+            for c in [1, 2, 3, 4]:
+                if pred_mean[c] > 0.002:
+                    cal_factors[c] = np.clip(obs_mean[c] / pred_mean[c], 0.5, 2.0)
+
+            # Apply calibration to all dynamic cells
+            dynamic_mask = ~np.isin(initial_grid_np, list(STATIC_TERRAINS))
+            for y in range(height):
+                for x in range(width):
+                    if not dynamic_mask[y, x]:
+                        continue
+                    prediction[y, x, 1:5] *= cal_factors[1:5]
+                    prediction[y, x] = np.maximum(prediction[y, x], PROB_FLOOR)
+                    prediction[y, x] /= prediction[y, x].sum()
+
+    # ── Dirichlet updating with observations ──
+    for y in range(height):
+        for x in range(width):
+            if obs_total[y, x] > 0 and initial_grid_np[y, x] not in STATIC_TERRAINS:
+                alpha = prediction[y, x] * prior_strength
+                posterior = alpha + obs_counts[y, x]
+                prediction[y, x] = posterior / posterior.sum()
 
     # Apply probability floor and renormalize
     prediction = np.maximum(prediction, PROB_FLOOR)
@@ -909,6 +1021,10 @@ def cmd_solve(session, round_data=None, dry_run=False):
                 extra_vp_idx += 1
             time.sleep(0.22)
 
+    # ── Cache observations for potential re-submission ──
+    obs_cache = {str(k): v for k, v in all_observations.items()}
+    cache_set(f"obs_r{active['round_number']}", obs_cache)
+
     # ── Final activity estimation & round matching ──
     sig = estimate_activity_from_observations(
         all_observations, initial_states, seeds_count, height, width)
@@ -925,11 +1041,13 @@ def cmd_solve(session, round_data=None, dry_run=False):
     print(f"Top matches: "
           + ", ".join(f"R{rd['round_number']}({w:.2f})" for rd, w in top_matched))
 
-    # ── Train HGBR ensemble ──
-    print("\nTraining HGBR ensemble...")
+    # ── Train ML ensemble ──
+    print("\nTraining ML ensemble...")
     X_train, y_train = build_training_data(session, round_data)
     hgbr_models = train_hgbr_models(X_train, y_train)
     print(f"  Trained {len(hgbr_models)} HGBR models on {X_train.shape[0]} samples")
+    rf_models = train_rf_models(X_train, y_train)
+    print(f"  Trained {len(rf_models)} RF models")
 
     # ── Build & submit predictions ──
     for seed_idx in range(seeds_count):
@@ -943,6 +1061,7 @@ def cmd_solve(session, round_data=None, dry_run=False):
             target_decay=observed_decay,
             observed_sig=sig,
             hgbr_models=hgbr_models,
+            rf_models=rf_models,
         )
 
         # Verify
@@ -1048,13 +1167,14 @@ def cmd_backtest(session, round_data=None):
         sig = test_rd["signature"]
         matched = match_rounds(sig, train_data)
 
-        # Train HGBR on all rounds except this one
+        # Train ML models on all rounds except this one
         start, end = round_ranges[rn]
         mask = np.ones(len(full_X), dtype=bool)
         mask[start:end] = False
         X_train_loo = full_X[mask]
         y_train_loo = full_y[mask]
         hgbr_models = train_hgbr_models(X_train_loo, y_train_loo)
+        rf_models_loo = train_rf_models(X_train_loo, y_train_loo)
 
         # Get ground truth and initial states
         round_info = completed.get(rn)
@@ -1080,13 +1200,14 @@ def cmd_backtest(session, round_data=None):
             init_grid = grid_to_np(initial_states[seed_idx]["grid"])
             settlements = settlement_positions(initial_states[seed_idx])
 
-            # Build prediction using ensemble (lookup + HGBR)
+            # Build prediction using triple ensemble (lookup + HGBR + RF)
             pred = build_prediction(
                 init_grid, settlements, [],
                 height, width, matched,
                 target_decay=target_decay,
                 observed_sig=sig,
                 hgbr_models=hgbr_models,
+                rf_models=rf_models_loo,
             )
             score = compute_score(pred, gt)
             seed_scores.append(score)

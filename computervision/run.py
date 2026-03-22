@@ -1,4 +1,4 @@
-"""Submission entry point: multi-class YOLO11 (ONNX) detection + classification."""
+"""Submission entry point: multi-class YOLO11 (ONNX) detection + classification with TTA."""
 import argparse
 import json
 from pathlib import Path
@@ -13,7 +13,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 YOLO_ONNX = SCRIPT_DIR / "yolo.onnx"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONF_THRESH = 0.15
+CONF_THRESH = 0.10
 IOU_THRESH = 0.5
 IMGSZ = 1280
 
@@ -40,7 +40,6 @@ def nms(boxes, scores, class_ids, iou_threshold=0.5):
     if len(boxes) == 0:
         return []
 
-    # Offset boxes by class_id for class-aware NMS
     max_coord = boxes.max()
     offsets = class_ids.astype(np.float32) * (max_coord + 1)
     boxes_offset = boxes.copy()
@@ -78,16 +77,8 @@ def nms(boxes, scores, class_ids, iou_threshold=0.5):
     return keep
 
 
-def run_yolo(session, img_bgr, imgsz=1280, conf_thresh=0.15, iou_thresh=0.5):
-    """Run YOLO ONNX inference, return boxes, scores, class_ids."""
-    orig_h, orig_w = img_bgr.shape[:2]
-    img_padded, scale, pad_left, pad_top = letterbox(img_bgr, imgsz)
-
-    # HWC BGR -> CHW RGB normalized
-    blob = img_padded[:, :, ::-1].astype(np.float32) / 255.0
-    blob = blob.transpose(2, 0, 1)[np.newaxis]
-
-    # Check input dtype
+def _infer_raw(session, blob):
+    """Run ONNX session, return decoded boxes_cxcywh, class_scores."""
     input_name = session.get_inputs()[0].name
     input_type = session.get_inputs()[0].type
     if "float16" in input_type:
@@ -96,49 +87,77 @@ def run_yolo(session, img_bgr, imgsz=1280, conf_thresh=0.15, iou_thresh=0.5):
     outputs = session.run(None, {input_name: blob})
     preds = outputs[0]  # [1, 4+nc, num_preds]
 
-    # Transpose if needed
     if preds.shape[1] < preds.shape[2]:
         preds = preds.transpose(0, 2, 1)
 
     preds = preds[0].astype(np.float32)  # [num_preds, 4+nc]
-    boxes_cxcywh = preds[:, :4]
-    class_scores = preds[:, 4:]
+    return preds[:, :4], preds[:, 4:]
 
-    # Get best class per prediction
-    class_ids = class_scores.argmax(axis=1)
-    scores = class_scores.max(axis=1)
 
-    # Filter by confidence
-    mask = scores > conf_thresh
-    boxes_cxcywh = boxes_cxcywh[mask]
-    scores = scores[mask]
-    class_ids = class_ids[mask]
+def run_yolo_tta(session, img_bgr, imgsz=1280, conf_thresh=0.10, iou_thresh=0.5):
+    """Run YOLO with horizontal flip TTA, return boxes, scores, class_ids."""
+    orig_h, orig_w = img_bgr.shape[:2]
 
-    if len(scores) == 0:
+    all_boxes = []
+    all_scores = []
+    all_class_ids = []
+
+    for flip in [False, True]:
+        img = img_bgr if not flip else img_bgr[:, ::-1].copy()
+
+        img_padded, scale, pad_left, pad_top = letterbox(img, imgsz)
+        blob = img_padded[:, :, ::-1].astype(np.float32) / 255.0
+        blob = blob.transpose(2, 0, 1)[np.newaxis]
+
+        boxes_cxcywh, class_scores = _infer_raw(session, blob)
+
+        class_ids = class_scores.argmax(axis=1)
+        scores = class_scores.max(axis=1)
+
+        mask = scores > conf_thresh
+        boxes_cxcywh = boxes_cxcywh[mask]
+        scores = scores[mask]
+        class_ids = class_ids[mask]
+
+        if len(scores) == 0:
+            continue
+
+        # Convert to xyxy
+        boxes_xyxy = np.empty_like(boxes_cxcywh)
+        boxes_xyxy[:, 0] = boxes_cxcywh[:, 0] - boxes_cxcywh[:, 2] / 2
+        boxes_xyxy[:, 1] = boxes_cxcywh[:, 1] - boxes_cxcywh[:, 3] / 2
+        boxes_xyxy[:, 2] = boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2
+        boxes_xyxy[:, 3] = boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2
+
+        # Rescale to original image
+        boxes_xyxy[:, [0, 2]] = (boxes_xyxy[:, [0, 2]] - pad_left) / scale
+        boxes_xyxy[:, [1, 3]] = (boxes_xyxy[:, [1, 3]] - pad_top) / scale
+
+        # Un-flip if needed
+        if flip:
+            x1 = orig_w - boxes_xyxy[:, 2]
+            x2 = orig_w - boxes_xyxy[:, 0]
+            boxes_xyxy[:, 0] = x1
+            boxes_xyxy[:, 2] = x2
+
+        # Clamp
+        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, orig_w)
+        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, orig_h)
+
+        all_boxes.append(boxes_xyxy)
+        all_scores.append(scores)
+        all_class_ids.append(class_ids)
+
+    if len(all_boxes) == 0:
         return np.empty((0, 4)), np.empty(0), np.empty(0, dtype=int)
 
-    # Convert to xyxy
-    boxes_xyxy = np.empty_like(boxes_cxcywh)
-    boxes_xyxy[:, 0] = boxes_cxcywh[:, 0] - boxes_cxcywh[:, 2] / 2
-    boxes_xyxy[:, 1] = boxes_cxcywh[:, 1] - boxes_cxcywh[:, 3] / 2
-    boxes_xyxy[:, 2] = boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2
-    boxes_xyxy[:, 3] = boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2
+    all_boxes = np.concatenate(all_boxes)
+    all_scores = np.concatenate(all_scores)
+    all_class_ids = np.concatenate(all_class_ids)
 
-    # NMS
-    keep = nms(boxes_xyxy, scores, class_ids, iou_thresh)
-    boxes_xyxy = boxes_xyxy[keep]
-    scores = scores[keep]
-    class_ids = class_ids[keep]
-
-    # Rescale to original image
-    boxes_xyxy[:, [0, 2]] = (boxes_xyxy[:, [0, 2]] - pad_left) / scale
-    boxes_xyxy[:, [1, 3]] = (boxes_xyxy[:, [1, 3]] - pad_top) / scale
-
-    # Clamp
-    boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, orig_w)
-    boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, orig_h)
-
-    return boxes_xyxy, scores, class_ids
+    # Final NMS across all TTA results
+    keep = nms(all_boxes, all_scores, all_class_ids, iou_thresh)
+    return all_boxes[keep], all_scores[keep], all_class_ids[keep]
 
 
 def main():
@@ -163,7 +182,7 @@ def main():
         if img_bgr is None:
             continue
 
-        boxes_xyxy, scores, class_ids = run_yolo(
+        boxes_xyxy, scores, class_ids = run_yolo_tta(
             session, img_bgr, IMGSZ, CONF_THRESH, IOU_THRESH
         )
 

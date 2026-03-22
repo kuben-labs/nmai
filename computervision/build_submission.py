@@ -6,7 +6,7 @@ import zipfile
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--yolo-onnx", default="runs/multiclass/weights/best.onnx")
+    parser.add_argument("--yolo-onnx", default="runs/detect/runs/exp_11x_1280/weights/best.onnx")
     parser.add_argument("--output", default="submission.zip")
     args = parser.parse_args()
 
