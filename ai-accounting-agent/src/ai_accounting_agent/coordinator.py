@@ -83,6 +83,8 @@ ESSENTIAL_TOOLS = {
     "Invoice_post",
     "Invoice_get",
     "InvoiceSend_send",
+    "InvoicePayment_payment",
+    "InvoicePaymentType_search",
     "IncomingInvoiceSearch_search",
     "IncomingInvoice_post",
     "IncomingInvoice_get",

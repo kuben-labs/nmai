@@ -10,7 +10,7 @@ ENDPOINT_URL = "https://689d-2001-700-1501-d124-99cb-97c5-ceb8-1585.ngrok-free.a
 ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI4ZTQ1NDRmYS00MzYyLTRjN2MtYmI5MS01MzI3MWZlNDU1ZmQiLCJlbWFpbCI6Imdvcm1lcnlrb21ib0BnbWFpbC5jb20iLCJpc19hZG1pbiI6ZmFsc2UsImV4cCI6MTc3NDU0NTA4Nn0.uVBow6pCnaKRfsb_v2Gm_2YKk6fxwZCSvK1uu4Et6Xc"
 
 COOKIES       = {"access_token": ACCESS_TOKEN}
-MAX_IN_FLIGHT = 3   # change to 2 if you want 2 at a time
+MAX_IN_FLIGHT = 1   # change to 2 if you want 2 at a time
 POLL_INTERVAL = 10  # seconds
 
 

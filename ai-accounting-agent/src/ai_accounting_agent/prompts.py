@@ -714,13 +714,18 @@ NOTE: If POST /invoice fails with "Faktura kan ikke opprettes før selskapet har
 
 **Process salary (payroll):**
 1. GET /employee?email=...&fields=id,firstName,lastName,dateOfBirth → find employee. If dateOfBirth is missing, PUT to add one (e.g. "1990-01-01").
-2. GET /employee/employment?employeeId=...&fields=id,startDate,division → check employment exists. If not, POST /employee/employment.
-3. GET /division?fields=id,name → check division exists. If none, create: GET /municipality to find a municipality ID, then POST /division with name, startDate, organizationNumber (different from company's), municipality.
+2. GET /employee/employment?employeeId=...&fields=id,startDate,division,occupationCode → check employment exists. If not, POST /employee/employment with employee, startDate, isMainEmployer: true.
+3. GET /division?fields=id,name → check division exists. If none, create: GET /municipality?fields=id,name&count=5 to find a municipality ID, then POST /division with name, startDate, organizationNumber (9 digits, different from company's), municipality.
 4. If employment has no division: PUT /employee/employment/{id} to link it (include division, id, version).
-5. GET /salary/type?fields=id,name,number&count=100 → find salary types ("Fastlønn" for base, "Bonus"/"Tillegg" for bonuses)
-6. POST /salary/transaction with date (last day of month), month, year, and payslips array
+5. Search for occupation code: EmployeeEmploymentOccupationCode_search({nameNO: "konsulent"}) — use a SHORT keyword related to the employee's role. Try "rådgiver", "konsulent", "regnskapsfører", "kontormedarbeider" etc.
+6. POST /employee/employment/details with employment, date, employmentType: "ORDINARY", employmentForm: "PERMANENT", percentageOfFullTimeEquivalent: 100, annualSalary (monthly × 12), occupationCode: {id: code_id}.
+   CRITICAL: ALWAYS set occupationCode. The scoring system checks this field.
+7. POST /employee/standardTime with employee: {id}, hoursPerDay: 7.5, fromDate: employment startDate.
+   CRITICAL: ALWAYS set standard time. Without it the employee setup is incomplete.
+8. GET /salary/type?fields=id,name,number&count=100 → find salary types ("Fastlønn"/#2000 for base salary, "Bonus"/"Tillegg" for bonuses)
+9. POST /salary/transaction with date (last day of month), month, year, and payslips array containing specifications with salaryType, count: 1, rate: amount, amount: amount.
 IMPORTANT: Do NOT use /ledger/voucher for salary — use /salary/transaction.
-IMPORTANT: Employee MUST have dateOfBirth, an employment, and the employment MUST have a division — otherwise salary will fail.
+IMPORTANT: Employee MUST have dateOfBirth, an employment with a division, employment details with occupationCode, and standard time — otherwise salary will fail or score poorly.
 
 **Delete travel expense:**
 1. GET /travelExpense?fields=id,title&count=100 → find the travel expense ID
@@ -754,17 +759,50 @@ CRITICAL: This task type REQUIRES posting vouchers. If you only read data and st
 IMPORTANT: Each correction voucher must BALANCE (sum=0). Match customer/supplier IDs from the original postings.
 
 **Bank reconciliation (match CSV payments to invoices):**
-1. Parse the CSV to identify payments (amounts, dates, references)
-2. GET /invoice/paymentType?fields=id,description → get payment type IDs for incoming payments
-3. GET /ledger/paymentTypeOut?fields=id,description → get payment type IDs for outgoing payments
-4. GET /invoice?invoiceDateFrom=2020-01-01&invoiceDateTo=2030-12-31&fields=id,invoiceNumber,invoiceDate,amount,amountCurrency,amountOutstanding,customer,kid&count=100 → get customer invoices
-5. GET /supplierInvoice?invoiceDateFrom=2020-01-01&invoiceDateTo=2030-12-31&fields=id,invoiceNumber,invoiceDate,amount,amountCurrency,supplier&count=100 → get supplier invoices
-6. Match incoming payments (positive amounts in CSV) to customer invoices by amount/reference/customer name
+1. Parse the CSV to identify payments (amounts, dates, references). Note: "Inn" = incoming, "Ut" = outgoing. Ignore non-payment rows (Bankgebyr, Skattetrekk, Renteinntekter — these are not invoice-related).
+2. GET /invoice/paymentType?fields=id,description → get payment type IDs for incoming payments (use "Betalt til bank")
+3. GET /ledger/paymentTypeOut?fields=id,description → get payment type IDs for outgoing payments (use "Manuelt betalt nettbank")
+4. GET /invoice?invoiceDateFrom=2020-01-01&invoiceDateTo=2030-12-31&fields=id,invoiceNumber,invoiceDate,amount,amountCurrency,amountOutstanding,amountCurrencyOutstanding,customer(id,name),kid&count=100 → get customer invoices
+5. GET /supplierInvoice?invoiceDateFrom=2020-01-01&invoiceDateTo=2030-12-31&fields=id,invoiceNumber,invoiceDate,amount,amountCurrency,supplier(id,name)&count=100 → get supplier invoices
+6. Match incoming payments (positive amounts / "Inn" column in CSV) to customer invoices by invoice number reference, customer name, or amount
 7. PUT /invoice/{id}/:payment?paymentDate=...&paymentTypeId=...&paidAmount=... → for EACH matched customer invoice
-8. Match outgoing payments (negative amounts in CSV) to supplier invoices by amount/reference/supplier name
-9. POST /supplierInvoice/{id}/:addPayment?paymentTypeId=...&amount=...&paidDate=... → for EACH matched supplier invoice
-CRITICAL: For supplier payments, you MUST use /supplierInvoice/{id}/:addPayment — do NOT create manual vouchers via /ledger/voucher. The scoring system checks supplier invoice payment status.
-IMPORTANT: Handle partial payments — if CSV amount doesn't exactly match an invoice, it might be a partial payment. Register the exact CSV amount as a partial payment.
+8. If NO supplier invoices found but CSV has outgoing supplier payments:
+   a. GET /supplier?fields=id,name&count=100 → find suppliers
+   b. For EACH supplier payment in the CSV, create a supplier invoice via POST /incomingInvoice (this is the ONLY endpoint to create supplier invoices):
+      IncomingInvoice_post({
+        "invoiceHeader": {"vendorId": supplierId, "invoiceNumber": "SUP-001", "invoiceDate": paymentDate, "dueDate": paymentDate, "invoiceAmount": absAmount},
+        "orderLines": [{"externalId": "line-1", "row": 1, "accountId": purchaseAccountId, "description": "Leverandørfaktura", "amountInclVat": absAmount, "vatTypeId": 1}]
+      })
+      NOTE: externalId is REQUIRED. Use accountId for a purchase account (e.g. 4000 "Innkjøp").
+      NOTE: Try first WITHOUT sendTo parameter (defaults to inbox). If that gets 403, try with sendTo=ledger. If still 403, try sendTo=nonPosted.
+   c. GET /supplierInvoice to find the newly created supplier invoices
+9. Match outgoing payments (negative amounts / "Ut" column in CSV) to supplier invoices by supplier name or amount
+10. POST /supplierInvoice/{id}/:addPayment?paymentTypeId=...&amount=...&paidDate=... → for EACH matched supplier invoice
+CRITICAL: For supplier payments, you MUST use /supplierInvoice/{id}/:addPayment — NEVER create manual vouchers via /ledger/voucher for supplier payments. The scoring system checks supplier invoice payment status, NOT ledger vouchers.
+CRITICAL: There is NO "POST /supplierInvoice" endpoint. To CREATE supplier invoices, use POST /incomingInvoice (IncomingInvoice_post). Then register payments via /supplierInvoice/{id}/:addPayment.
+IMPORTANT: Handle partial payments — if CSV amount doesn't exactly match an invoice, register the exact CSV amount as a partial payment.
+IMPORTANT: Do NOT post vouchers for supplier payments. Focus on matching payments to invoices via the proper payment APIs.
+
+**Register supplier invoice (factura proveedor / leverandørfaktura):**
+This is for tasks that say "register supplier invoice", "registrer leverandørfaktura", "registre la factura del proveedor", etc.
+1. GET /supplier?organizationNumber=...&fields=id,name,organizationNumber → find supplier. If not found, POST /supplier to create.
+2. GET /ledger/account?number=XXXX&fields=id,number,name → find the expense account specified in the task
+3. GET /ledger/vatType?fields=id,name,number,percentage&count=100 → find VAT types. For 25% input VAT use vatType with name "Fradrag inngående avgift, høy sats" (id typically 1).
+4. POST /incomingInvoice?sendTo=ledger with body:
+   {
+     "invoiceHeader": {"vendorId": supplierId, "invoiceNumber": "INV-...", "invoiceDate": "YYYY-MM-DD", "dueDate": "YYYY-MM-DD", "invoiceAmount": totalInclVat},
+     "orderLines": [{"externalId": "line-1", "row": 1, "accountId": expenseAccountId, "description": "...", "amountInclVat": totalInclVat, "vatTypeId": vatId}]
+   }
+   NOTE: externalId is REQUIRED on each order line. Use "line-1", "line-2", etc.
+   NOTE: invoiceAmount is the TOTAL including VAT. amountInclVat on each order line is also INCLUDING VAT. The system calculates net and VAT automatically.
+5. If IncomingInvoice_post returns 403 (permission denied), fall back to ledger voucher approach:
+   a. Calculate: net = totalInclVat / 1.25 (for 25% VAT), VAT = totalInclVat - net
+   b. POST /ledger/voucher with postings (MUST include row numbers starting at 1):
+      - {row: 1, account: {id: expenseAccountId}, amount: net, description: "..."}
+      - {row: 2, account: {id: inputVatAccountId}, amount: vat, description: "MVA 25%"}
+      - {row: 3, account: {id: apAccountId}, amount: -totalInclVat, supplier: {id: supplierId}, description: "..."}
+   CRITICAL: Include supplier: {id: X} on the accounts payable (2400) posting. Include row numbers on ALL postings.
+IMPORTANT: Always try IncomingInvoice_post FIRST with sendTo=ledger. Only use voucher as fallback if you get 403.
 
 **Register supplier invoice payment:**
 1. GET /supplierInvoice?fields=*&count=100 → find supplier invoice
@@ -788,11 +826,12 @@ IMPORTANT: Handle partial payments — if CSV amount doesn't exactly match an in
    - 7500: Forsikring (insurance)
 5. GET /ledger/vatType?fields=id,name,percentage&count=100 → find VAT type. Common: 25% general, 12% transport, 15% food
 6. Calculate: net amount = total / (1 + vatRate), VAT = total - net
-7. POST /ledger/voucher with postings:
-   - Debit expense account (net amount) with department
-   - Debit input VAT account (VAT amount)
-   - Credit 2400 (accounts payable) with supplier: {"id": supplierId} — REQUIRED on 2400 posting
+7. POST /ledger/voucher with postings (MUST include row numbers starting at 1):
+   - {row: 1, account: {id: expenseAcctId}, amount: net, department: {id: deptId}, description: "..."}
+   - {row: 2, account: {id: inputVatAcctId}, amount: vat, description: "MVA"}
+   - {row: 3, account: {id: 2400acctId}, amount: -total, supplier: {id: supplierId}, description: "..."}
 CRITICAL: You MUST look up the supplier from the receipt and include supplier: {"id": X} on the accounts payable (2400) posting line.
+CRITICAL: You MUST include row numbers (row: 1, row: 2, row: 3) on ALL postings. Without row numbers, the voucher will fail with "systemgenererte" error.
 
 ## DATE FORMAT
 - Always use ISO format: "YYYY-MM-DD" (e.g., "2026-03-21")
