@@ -6,3 +6,4 @@ submission/
 submission.zip
 __pycache__/
 .ruff_cache/
+submission*
