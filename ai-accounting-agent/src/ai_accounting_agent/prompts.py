@@ -86,8 +86,14 @@ PROJECT (Project_post):
   COMMON: isInternal: true, customer: {id: N}
 
 PROJECT ACTIVITY (ProjectProjectActivity_post):
-  REQUIRED: project: {id: N}, activity: {name: "...", activityType: "PROJECT_SPECIFIC_ACTIVITY"}
-  CRITICAL: Search Activity_search({name: "..."}) FIRST. If activity exists, use activity: {id: existing_id} instead of creating new.
+  To create a new project-specific activity:
+    ProjectProjectActivity_post({project: {id: N}, activity: {name: "...", activityType: "PROJECT_SPECIFIC_ACTIVITY"}})
+  To link an existing activity to a project:
+    ProjectProjectActivity_post({project: {id: N}, activity: {id: existing_activity_id}})
+  CRITICAL: If you get 409 Duplicate, it means an activity with that name already exists globally.
+    In that case: use Activity_search({}) with NO name filter (get ALL activities), find the matching one by name, then link by ID.
+    Activity_search with a specific name may return 0 even when the activity exists (search is unreliable for project-specific activities).
+  CRITICAL: Create project activities ONE AT A TIME, not in parallel. This avoids race conditions causing false 409 errors.
 
 DEPARTMENT (Department_post):
   REQUIRED: name
@@ -161,7 +167,10 @@ WORKFLOW: Analyze Ledger and Create Projects
   2. Compare periods, identify accounts with largest changes
   3. Employee_search({count: 1}) → get a project manager ID
   4. For each account: Project_post({name: account_name, startDate, isInternal: true, projectManager: {id}})
-  5. For each project: SEARCH Activity_search({name: "..."}) first, then ProjectProjectActivity_post using existing ID or creating new
+  5. For each project, create activity ONE AT A TIME (not parallel):
+     a. ProjectProjectActivity_post({project: {id}, activity: {name: account_name, activityType: "PROJECT_SPECIFIC_ACTIVITY"}})
+     b. If 409 Duplicate: Activity_search({}) → find the existing activity by name in the full list → ProjectProjectActivity_post({project: {id}, activity: {id: found_id}})
+     c. If still 409 after linking by ID: the activity is already linked — move on to the next project.
 
 WORKFLOW: Record Expense from Receipt/Kvittering
   This is for tasks that say "record expense", "book receipt", "kvittering", "Ausgabe", "quittung", "utgift".
@@ -196,9 +205,9 @@ WORKFLOW: Create Project with Activity
   1. Employee_search({count: 1}) → get projectManager ID
   2. Customer_search if project is for a customer
   3. Project_post({name, startDate, projectManager: {id}, isInternal/customer})
-  4. Activity_search({name: "desired_name"}) → check if activity exists
-  5. If exists: ProjectProjectActivity_post({project: {id}, activity: {id: existing_id}})
-  6. If not: ProjectProjectActivity_post({project: {id}, activity: {name: "...", activityType: "PROJECT_SPECIFIC_ACTIVITY"}})
+  4. ProjectProjectActivity_post({project: {id}, activity: {name: "activity_name", activityType: "PROJECT_SPECIFIC_ACTIVITY"}})
+  5. If 409: Activity_search({}) → get ALL activities, find match by name → ProjectProjectActivity_post({project: {id}, activity: {id: found_id}})
+  6. If still 409: activity already linked, move on.
 </workflows>
 
 <error-handling>
