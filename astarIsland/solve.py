@@ -13,11 +13,15 @@ import sys
 import time
 import json
 import argparse
+import warnings
 import numpy as np
 import requests
 from pathlib import Path
 from collections import defaultdict
 from sklearn.ensemble import HistGradientBoostingRegressor, ExtraTreesRegressor
+import lightgbm as lgb
+
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 BASE_URL = "https://api.ainm.no"
 CACHE_DIR = Path(__file__).parent / ".cache"
@@ -490,7 +494,11 @@ def compute_features_for_cell(terrain, dist, coastal, adj_forest, adj_mountain,
                                sig, decay_profile,
                                x_norm=0.0, y_norm=0.0, n_total_settl=0.0,
                                ocean_ratio=0.0, forest_ratio=0.0,
-                               dist_to_port=15.0, adj_ruin=0):
+                               dist_to_port=15.0, adj_ruin=0,
+                               dist_to_edge=0.0, n_total_ports=0.0,
+                               dist_to_2nd_settl=15.0,
+                               local_forest_frac=0.0, local_empty_frac=0.0,
+                               nearest_settl_food_cap=0.0):
     """Compute feature vector for a single cell."""
     # Terrain one-hot (5 dims)
     is_settlement = 1.0 if terrain in (SETTLEMENT, PORT) else 0.0
@@ -521,6 +529,12 @@ def compute_features_for_cell(terrain, dist, coastal, adj_forest, adj_mountain,
     dd = min(int(dist), 8)
     expansion_at_d = decay_profile.get(dd, decay_profile.get(str(dd), 0.0))
 
+    # New spatial features (6 dims)
+    edge_norm = min(dist_to_edge, 20) / 20.0
+    ports_norm = n_total_ports / 10.0
+    d2nd_norm = min(dist_to_2nd_settl, 20) / 20.0
+    food_norm = nearest_settl_food_cap / 8.0
+
     return [
         is_settlement, is_port, is_forest, is_empty, is_ruin,
         d_norm, coastal_f, dist_inv, port_d_norm,
@@ -531,6 +545,8 @@ def compute_features_for_cell(terrain, dist, coastal, adj_forest, adj_mountain,
         settl_surv, exp_rate, forest_surv,
         d1, d2, d3, d4, d5,
         decay_ratio, expansion_at_d,
+        edge_norm, ports_norm, d2nd_norm,
+        local_forest_frac, local_empty_frac, food_norm,
     ]
 
 
@@ -584,21 +600,75 @@ def compute_cell_maps(init_grid_np, settlements, height, width):
                 if d < dist_to_port[y, x]:
                     dist_to_port[y, x] = d
 
+    # Distance to map edge
+    dist_to_edge = np.zeros((height, width), dtype=np.int16)
+    for y in range(height):
+        for x in range(width):
+            dist_to_edge[y, x] = min(x, y, width - 1 - x, height - 1 - y)
+
+    # Distance to 2nd nearest settlement
+    dist_to_2nd = np.full((height, width), 999, dtype=np.int16)
+    for y in range(height):
+        for x in range(width):
+            dists = sorted(max(abs(x - sx), abs(y - sy)) for sx, sy, _ in settlements)
+            if len(dists) >= 2:
+                dist_to_2nd[y, x] = dists[1]
+
+    # Local terrain composition in 5x5 neighborhood
+    local_forest = np.zeros((height, width), dtype=np.float32)
+    local_empty = np.zeros((height, width), dtype=np.float32)
+    forest_mask_f = (init_grid_np == FOREST).astype(np.float32)
+    empty_mask_f = np.isin(init_grid_np, [EMPTY, PLAINS]).astype(np.float32)
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            local_forest += np.roll(np.roll(forest_mask_f, dy, axis=0), dx, axis=1)
+            local_empty += np.roll(np.roll(empty_mask_f, dy, axis=0), dx, axis=1)
+    local_forest /= 25.0
+    local_empty /= 25.0
+
+    # Nearest settlement's food capacity (adjacent forests to nearest settlement)
+    nearest_settl_food = np.zeros((height, width), dtype=np.float32)
+    for y in range(height):
+        for x in range(width):
+            # Find nearest settlement
+            best_d = 999
+            best_sx, best_sy = -1, -1
+            for sx, sy, _ in settlements:
+                d = max(abs(x - sx), abs(y - sy))
+                if d < best_d:
+                    best_d = d
+                    best_sx, best_sy = sx, sy
+            if best_sx >= 0:
+                # Count forests adjacent to that settlement
+                food = 0
+                for ddy in [-1, 0, 1]:
+                    for ddx in [-1, 0, 1]:
+                        ny, nx = best_sy + ddy, best_sx + ddx
+                        if 0 <= ny < height and 0 <= nx < width:
+                            if init_grid_np[ny, nx] == FOREST:
+                                food += 1
+                nearest_settl_food[y, x] = food
+
     # Map-level stats
     total_cells = height * width
     n_total_settl = float(len(settlements))
+    n_total_ports = float(sum(1 for _, _, hp in settlements if hp))
     ocean_ratio = float(np.sum(init_grid_np == OCEAN)) / total_cells
     forest_ratio = float(np.sum(init_grid_np == FOREST)) / total_cells
 
     return (dist_map, coastal_map, forest_adj, adj_mtn, adj_ocn, adj_stl, adj_ruin,
-            n_d2, n_d4, n_d6, dist_to_port, n_total_settl, ocean_ratio, forest_ratio)
+            n_d2, n_d4, n_d6, dist_to_port, n_total_settl, ocean_ratio, forest_ratio,
+            dist_to_edge, n_total_ports, dist_to_2nd,
+            local_forest, local_empty, nearest_settl_food)
 
 
 def build_features_grid(init_grid_np, settlements, height, width, sig, decay_profile):
     """Build feature matrix for all non-static cells."""
     maps = compute_cell_maps(init_grid_np, settlements, height, width)
     (dist_map, coastal_map, forest_adj, adj_mtn, adj_ocn, adj_stl, adj_ruin,
-     n_d2, n_d4, n_d6, dist_to_port, n_total_settl, ocean_ratio, forest_ratio) = maps
+     n_d2, n_d4, n_d6, dist_to_port, n_total_settl, ocean_ratio, forest_ratio,
+     dist_to_edge, n_total_ports, dist_to_2nd,
+     local_forest, local_empty, nearest_settl_food) = maps
 
     features = []
     coords = []
@@ -618,6 +688,12 @@ def build_features_grid(init_grid_np, settlements, height, width, sig, decay_pro
                 forest_ratio=forest_ratio,
                 dist_to_port=int(dist_to_port[y, x]),
                 adj_ruin=int(adj_ruin[y, x]),
+                dist_to_edge=int(dist_to_edge[y, x]),
+                n_total_ports=n_total_ports,
+                dist_to_2nd_settl=int(dist_to_2nd[y, x]),
+                local_forest_frac=float(local_forest[y, x]),
+                local_empty_frac=float(local_empty[y, x]),
+                nearest_settl_food_cap=float(nearest_settl_food[y, x]),
             )
             features.append(feat)
             coords.append((y, x))
@@ -690,13 +766,22 @@ def build_training_data(session, round_data):
             init_grid = grid_to_np(initial_states[seed_idx]["grid"])
             settlements = settlement_positions(initial_states[seed_idx])
 
+            # Original
             X, coords = build_features_grid(init_grid, settlements, height, width, sig, decay)
-
             targets = np.array([gt[y, x] for y, x in coords], dtype=np.float32)
             all_X.append(X)
             all_y.append(targets)
 
-        print(f"  R{rn}: processed")
+            # Augmentation: horizontal flip
+            grid_flip = np.fliplr(init_grid)
+            gt_flip = np.fliplr(gt)
+            settl_flip = [(width - 1 - sx, sy, hp) for sx, sy, hp in settlements]
+            X_f, coords_f = build_features_grid(grid_flip, settl_flip, height, width, sig, decay)
+            targets_f = np.array([gt_flip[y, x] for y, x in coords_f], dtype=np.float32)
+            all_X.append(X_f)
+            all_y.append(targets_f)
+
+        print(f"  R{rn}: processed (2x augmented)")
 
     X = np.vstack(all_X)
     y = np.vstack(all_y)
@@ -706,15 +791,48 @@ def build_training_data(session, round_data):
     return X, y
 
 
+def _compute_entropy_weights(y):
+    """Compute entropy-based sample weights. High-entropy cells get more weight."""
+    entropy = -np.sum(y * np.log(y + 1e-15), axis=1)
+    # Shift so minimum entropy cells still have some weight
+    weights = entropy + 0.1
+    weights /= weights.mean()
+    return weights
+
+
 def train_hgbr_models(X, y):
-    """Train one HGBR per class. Returns list of 6 models."""
+    """Train one HGBR per class. Returns list of 6 models. Fast alternative to ExtraTrees."""
+    weights = _compute_entropy_weights(y)
     models = []
     for c in range(N_CLASSES):
         model = HistGradientBoostingRegressor(
-            max_iter=300, max_depth=5, learning_rate=0.05,
-            min_samples_leaf=20, random_state=42,
+            max_iter=400, max_depth=6, learning_rate=0.04,
+            min_samples_leaf=15, random_state=42,
         )
-        model.fit(X, y[:, c])
+        model.fit(X, y[:, c], sample_weight=weights)
+        models.append(model)
+    return models
+
+
+USE_GPU = False  # Set via --gpu flag
+
+def train_lgbm_models(X, y):
+    """Train one LightGBM per class."""
+    weights = _compute_entropy_weights(y)
+    models = []
+    params = dict(
+        n_estimators=600, max_depth=7, learning_rate=0.025,
+        min_child_samples=20, num_leaves=63,
+        subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.1, reg_lambda=0.1,
+        random_state=42, verbose=-1, n_jobs=-1,
+    )
+    if USE_GPU:
+        params["device"] = "gpu"
+        params["gpu_use_dp"] = True
+    for c in range(N_CLASSES):
+        model = lgb.LGBMRegressor(**params)
+        model.fit(X, y[:, c], sample_weight=weights)
         models.append(model)
     return models
 
@@ -931,7 +1049,7 @@ def cmd_info(session):
         pass
 
 
-def cmd_solve(session, round_data=None, dry_run=False):
+def cmd_solve(session, round_data=None, dry_run=False, do_submit=True):
     """Solve the active round with per-round calibration."""
     rounds = api_get(session, "/astar-island/rounds")
     active = next((r for r in rounds if r["status"] == "active"), None)
@@ -1064,10 +1182,10 @@ def cmd_solve(session, round_data=None, dry_run=False):
     # ── Train ML ensemble ──
     print("\nTraining ML ensemble...")
     X_train, y_train = build_training_data(session, round_data)
+    lgbm_models = train_lgbm_models(X_train, y_train)
+    print(f"  Trained {len(lgbm_models)} LightGBM models on {X_train.shape[0]} samples")
     hgbr_models = train_hgbr_models(X_train, y_train)
-    print(f"  Trained {len(hgbr_models)} HGBR models on {X_train.shape[0]} samples")
-    rf_models = train_rf_models(X_train, y_train)
-    print(f"  Trained {len(rf_models)} RF models")
+    print(f"  Trained {len(hgbr_models)} HGBR models")
 
     # ── Build & submit predictions ──
     for seed_idx in range(seeds_count):
@@ -1080,8 +1198,8 @@ def cmd_solve(session, round_data=None, dry_run=False):
             height, width, matched,
             target_decay=observed_decay,
             observed_sig=sig,
-            hgbr_models=hgbr_models,
-            rf_models=rf_models,
+            hgbr_models=lgbm_models,
+            rf_models=hgbr_models,
         )
 
         # Verify
@@ -1090,16 +1208,23 @@ def cmd_solve(session, round_data=None, dry_run=False):
         assert np.allclose(sums, 1.0, atol=0.02)
         assert (pred >= 0).all()
 
-        print(f"\nSeed {seed_idx}: submitting... ", end="")
-        result = api_post(session, "/astar-island/submit", {
-            "round_id": round_id,
-            "seed_index": seed_idx,
-            "prediction": pred.tolist(),
-        })
-        print(f"{result.get('status', result)}")
-        time.sleep(0.5)
+        if do_submit:
+            print(f"\nSeed {seed_idx}: submitting... ", end="")
+            result = api_post(session, "/astar-island/submit", {
+                "round_id": round_id,
+                "seed_index": seed_idx,
+                "prediction": pred.tolist(),
+            })
+            print(f"{result.get('status', result)}")
+            time.sleep(0.5)
+        else:
+            # Estimate score based on prediction entropy
+            ent = -np.sum(pred * np.log(pred + 1e-15), axis=-1)
+            mean_ent = ent[ent > 0.001].mean() if (ent > 0.001).any() else 0
+            print(f"\nSeed {seed_idx}: predicted (not submitted). "
+                  f"Mean entropy={mean_ent:.3f}, max={ent.max():.3f}")
 
-    print("\nDone!")
+    print("\nDone!" if do_submit else "\nDone! (predictions NOT submitted)")
     budget = api_get(session, "/astar-island/budget")
     print(f"Final budget: {budget['queries_used']}/{budget['queries_max']}")
 
@@ -1161,7 +1286,7 @@ def cmd_backtest(session, round_data=None):
             ig = grid_to_np(istates[si]["grid"])
             n_dynamic = int(np.sum(~np.isin(ig, list(STATIC_TERRAINS))))
             count += n_dynamic
-        round_sample_counts[rn] = count
+        round_sample_counts[rn] = count * 2  # 2x for horizontal flip augmentation
 
     # Build index ranges per round
     round_ranges = {}
@@ -1193,8 +1318,8 @@ def cmd_backtest(session, round_data=None):
         mask[start:end] = False
         X_train_loo = full_X[mask]
         y_train_loo = full_y[mask]
+        lgbm_models = train_lgbm_models(X_train_loo, y_train_loo)
         hgbr_models = train_hgbr_models(X_train_loo, y_train_loo)
-        rf_models_loo = train_rf_models(X_train_loo, y_train_loo)
 
         # Get ground truth and initial states
         round_info = completed.get(rn)
@@ -1225,8 +1350,8 @@ def cmd_backtest(session, round_data=None):
                 height, width, matched,
                 target_decay=target_decay,
                 observed_sig=sig,
-                hgbr_models=hgbr_models,
-                rf_models=rf_models_loo,
+                hgbr_models=lgbm_models,
+                rf_models=hgbr_models,
             )
             score = compute_score(pred, gt)
             seed_scores.append(score)
@@ -1261,6 +1386,210 @@ def cmd_scores(session):
 
 
 # ─────────────────────────────────────────────
+# Resubmit with Parameter Optimization
+# ─────────────────────────────────────────────
+
+def cmd_resubmit(session, round_data=None, do_submit=False):
+    """Resubmit with optimized parameters using cached observations."""
+    rounds = api_get(session, "/astar-island/rounds")
+    active = next((r for r in rounds if r["status"] == "active"), None)
+    if not active:
+        print("No active round!")
+        return
+
+    round_id = active["id"]
+    rn = active["round_number"]
+    width = active["map_width"]
+    height = active["map_height"]
+    print(f"Resubmitting R{rn}: {width}x{height}")
+
+    detail = api_get(session, f"/astar-island/rounds/{round_id}")
+    seeds_count = detail.get("seeds_count", 5)
+    initial_states = detail.get("initial_states", [])
+
+    obs_cache = cache_get(f"obs_r{rn}")
+    if not obs_cache:
+        print(f"No cached observations for R{rn}! Run --solve first.")
+        return
+    all_observations = {int(k): v for k, v in obs_cache.items()}
+
+    if not round_data:
+        round_data = cache_get("round_data_v2")
+    if not round_data:
+        print("No round data! Run --study first.")
+        return
+
+    # Activity estimation & matching
+    sig = estimate_activity_from_observations(
+        all_observations, initial_states, seeds_count, height, width)
+    observed_decay = sig.get("observed_decay", None)
+    matched = match_rounds(sig, round_data)
+    print(f"Activity: surv={sig['settl_survival']:.3f} "
+          f"exp={sig['expansion_rate']:.3f} forest={sig['forest_survival']:.3f}")
+
+    # Train models once
+    print("Training ML models...")
+    X_train, y_train = build_training_data(session, round_data)
+    lgbm_models = train_lgbm_models(X_train, y_train)
+    hgbr_models = train_hgbr_models(X_train, y_train)
+    print(f"  {X_train.shape[0]} samples, {X_train.shape[1]} features")
+
+    # Precompute per-seed: lookup predictions, ML predictions, observation counts
+    print("Precomputing per-seed predictions...")
+    seed_data = []
+    for seed_idx in range(seeds_count):
+        init_grid = grid_to_np(initial_states[seed_idx]["grid"])
+        settlements = settlement_positions(initial_states[seed_idx])
+        decay_for_feat = observed_decay if observed_decay else {}
+
+        # ML predictions
+        X, coords = build_features_grid(init_grid, settlements, height, width, sig, decay_for_feat)
+        lgbm_preds = predict_ml(lgbm_models, X)
+        hgbr_preds_ml = predict_ml(hgbr_models, X)
+
+        # Build lookup prediction (with decay/survival rescaling)
+        dist_map = distance_to_nearest_settlement(height, width, settlements)
+        coastal_map = is_coastal_map(init_grid)
+        blended_decay = get_blended_decay(matched) if observed_decay else {}
+        blended_surv = sum(w * rd["signature"]["settl_survival"] for rd, w in matched)
+        obs_surv = sig.get("settl_survival", blended_surv)
+        surv_scale = max(0.2, min(obs_surv / max(blended_surv, 0.01), 3.0))
+
+        lookup = np.zeros((height, width, N_CLASSES), dtype=np.float64)
+        static_mask = np.zeros((height, width), dtype=bool)
+        for y in range(height):
+            for x in range(width):
+                terrain = int(init_grid[y, x])
+                if terrain == OCEAN:
+                    lookup[y, x, 0] = 1.0
+                    static_mask[y, x] = True
+                elif terrain == MOUNTAIN:
+                    lookup[y, x, 5] = 1.0
+                    static_mask[y, x] = True
+                else:
+                    d = int(dist_map[y, x])
+                    c = bool(coastal_map[y, x])
+                    prior = get_matched_prior(matched, terrain, d, c).copy()
+                    # Survival rescaling
+                    if terrain in (SETTLEMENT, PORT) and abs(surv_scale - 1.0) > 0.05:
+                        sm = prior[1] + prior[2]
+                        if sm > 0.01:
+                            f = min(sm * surv_scale, 0.99) / sm
+                            prior[1] *= f; prior[2] *= f
+                            prior = np.maximum(prior, 0); prior /= prior.sum()
+                    # Decay rescaling
+                    if observed_decay and d >= 1:
+                        bd = blended_decay.get(d, 0)
+                        td = observed_decay.get(d, observed_decay.get(str(d), bd))
+                        if bd > 0.005:
+                            scale = np.clip(td / bd, 0.1, 5.0)
+                        else:
+                            scale = 1.0
+                        sm = prior[1] + prior[2]
+                        if sm > 0.001 and abs(scale - 1.0) > 0.05:
+                            f = min(sm * scale, 0.9) / sm
+                            prior[1] *= f; prior[2] *= f
+                            prior = np.maximum(prior, 0); prior /= prior.sum()
+                    lookup[y, x] = prior
+
+        # Build ML prediction grids
+        lgbm_grid = np.zeros((height, width, N_CLASSES), dtype=np.float64)
+        hgbr_grid = np.zeros((height, width, N_CLASSES), dtype=np.float64)
+        for i, (y, x) in enumerate(coords):
+            lgbm_grid[y, x] = lgbm_preds[i]
+            hgbr_grid[y, x] = hgbr_preds_ml[i]
+
+        # Observation counts
+        obs_counts = np.zeros((height, width, N_CLASSES), dtype=np.float64)
+        obs_total = np.zeros((height, width), dtype=np.float64)
+        for obs_grid, vx, vy, vw, vh in all_observations[seed_idx]:
+            for dy in range(vh):
+                for dx in range(vw):
+                    y, x = vy + dy, vx + dx
+                    if y >= height or x >= width:
+                        continue
+                    cls = TERRAIN_TO_CLASS.get(obs_grid[dy][dx], 0)
+                    obs_counts[y, x, cls] += 1.0
+                    obs_total[y, x] += 1.0
+
+        dynamic_mask = ~static_mask
+        obs_mask = (obs_total > 0) & dynamic_mask
+
+        seed_data.append({
+            "lookup": lookup, "lgbm": lgbm_grid, "hgbr": hgbr_grid,
+            "obs_counts": obs_counts, "obs_total": obs_total,
+            "dynamic_mask": dynamic_mask, "obs_mask": obs_mask,
+            "init_grid": init_grid,
+        })
+
+    # ── Use proven defaults (validated via backtest, NOT observation NLL) ──
+    # WARNING: Do NOT tune these via NLL on observations — that metric is
+    # biased toward low prior_strength and overfits to noisy single observations.
+    # These defaults are validated against actual ground truth in backtest.
+    wc = (0.4, 0.3, 0.3)
+    ps = 15
+    floor = PROB_FLOOR
+    temp = 1.0
+    cal_clip = (0.5, 2.0)
+    print(f"Using proven defaults: weights={wc}, ps={ps}, floor={floor}")
+
+    # ── Build final predictions with proven defaults ──
+    a_look, a_lgbm, a_hgbr = wc
+    cal_lo, cal_hi = cal_clip
+    final_preds = {}
+
+    for seed_idx, sd in enumerate(seed_data):
+        pred = sd["lookup"].copy()
+        dm = sd["dynamic_mask"]
+        pred[dm] = (a_look * sd["lookup"][dm]
+                    + a_lgbm * sd["lgbm"][dm]
+                    + a_hgbr * sd["hgbr"][dm])
+
+        # Calibration
+        om = sd["obs_mask"]
+        if int(om.sum()) >= 20:
+            obs_freq = sd["obs_counts"][om] / sd["obs_total"][om, np.newaxis]
+            pred_mean = pred[om].mean(axis=0)
+            obs_mean = obs_freq.mean(axis=0)
+            cal = np.ones(N_CLASSES)
+            for c in [1, 2, 3, 4]:
+                if pred_mean[c] > 0.002:
+                    cal[c] = np.clip(obs_mean[c] / pred_mean[c], cal_lo, cal_hi)
+            pred[dm, 1:5] *= cal[np.newaxis, 1:5]
+            pred[dm] = np.maximum(pred[dm], 1e-8)
+            pred[dm] /= pred[dm].sum(axis=-1, keepdims=True)
+
+        # Dirichlet update
+        alpha = pred[om] * ps
+        posterior = alpha + sd["obs_counts"][om]
+        pred[om] = posterior / posterior.sum(axis=-1, keepdims=True)
+
+        pred = np.maximum(pred, floor)
+        pred /= pred.sum(axis=-1, keepdims=True)
+        final_preds[seed_idx] = pred
+
+    if not do_submit:
+        print("\nDry run — not submitting. Use --resubmit --submit to submit.")
+        return final_preds
+
+    # Submit
+    for seed_idx in range(seeds_count):
+        pred = final_preds[seed_idx]
+        assert pred.shape == (height, width, N_CLASSES)
+        assert np.allclose(pred.sum(axis=-1), 1.0, atol=0.02)
+        print(f"Seed {seed_idx}: submitting... ", end="")
+        result = api_post(session, "/astar-island/submit", {
+            "round_id": round_id,
+            "seed_index": seed_idx,
+            "prediction": pred.tolist(),
+        })
+        print(f"{result.get('status', result)}")
+        time.sleep(0.5)
+
+    print("Done!")
+
+
+# ─────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────
 
@@ -1273,11 +1602,21 @@ def main():
     parser.add_argument("--scores", action="store_true", help="Show scores")
     parser.add_argument("--all", action="store_true", help="Study + solve")
     parser.add_argument("--backtest", action="store_true", help="Backtest on past rounds")
+    parser.add_argument("--gpu", action="store_true", help="Use GPU for LightGBM training")
+    parser.add_argument("--resubmit", action="store_true", help="Resubmit with optimized params")
+    parser.add_argument("--submit", action="store_true", help="Actually submit (with --resubmit)")
+    parser.add_argument("--no-submit", action="store_true", help="Run solve without submitting")
     args = parser.parse_args()
 
-    if not any([args.info, args.study, args.solve, args.dry_run, args.scores, args.all, args.backtest]):
+    if not any([args.info, args.study, args.solve, args.dry_run, args.scores,
+                args.all, args.backtest, args.resubmit]):
         parser.print_help()
         return
+
+    global USE_GPU
+    if args.gpu:
+        USE_GPU = True
+        print("GPU mode enabled for LightGBM")
 
     token = load_token()
     session = make_session(token)
@@ -1291,13 +1630,16 @@ def main():
     if args.backtest:
         cmd_backtest(session)
         return
+    if args.resubmit:
+        cmd_resubmit(session, do_submit=args.submit)
+        return
 
     round_data = None
     if args.study or args.all:
         round_data = cmd_study(session)
 
     if args.solve or args.all:
-        cmd_solve(session, round_data=round_data)
+        cmd_solve(session, round_data=round_data, do_submit=not args.no_submit)
     elif args.dry_run:
         cmd_solve(session, round_data=round_data, dry_run=True)
 

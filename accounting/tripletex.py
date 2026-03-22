@@ -109,6 +109,8 @@ class TripletexClient:
                 return "Missing required field 'customer' (object with id) for POST /order"
             if not data.get("deliveryDate"):
                 return "Missing required field 'deliveryDate' for POST /order"
+            if not data.get("orderDate"):
+                return "Missing required field 'orderDate' for POST /order"
 
         # Invoice: requires invoiceDate + invoiceDueDate + orders
         elif ep.endswith("/invoice"):
@@ -202,8 +204,8 @@ class TripletexClient:
 
         if "ledger/voucher" in endpoint and data:
             data = self._fix_voucher_postings(data)
-        if endpoint.rstrip("/").endswith("/employee") and data and "userType" not in data:
-            data["userType"] = "NO_ACCESS"
+        if endpoint.rstrip("/").endswith("/employee") and data:
+            data["userType"] = "NO_ACCESS"  # Always force NO_ACCESS — STANDARD requires license
         if "perDiemCompensation" in endpoint and data:
             data = self._fix_per_diem(data)
         url = f"{self.base_url}/{endpoint.lstrip('/')}"

@@ -204,7 +204,31 @@ Get currencies. Use `?code=NOK` or `?code=EUR` to filter.
 ### Country: GET /country
 Get countries. Use `?fields=id,name,isoAlpha2Code` to search. Norway = id 161, isoAlpha2Code "NO".
 
-### Supplier Invoice: GET /supplierInvoice
+### Incoming Invoice (Supplier Invoice): POST /incomingInvoice?sendTo=ledger
+USE THIS to register supplier invoices — NOT /ledger/voucher. The scoring checks for proper incoming invoice entities.
+Body structure:
+```json
+{
+  "invoiceHeader": {
+    "vendorId": SUPPLIER_ID,
+    "invoiceDate": "YYYY-MM-DD",
+    "dueDate": "YYYY-MM-DD",
+    "invoiceAmount": TOTAL_AMOUNT_INCL_VAT,
+    "description": "Description",
+    "invoiceNumber": "INV-..."
+  },
+  "orderLines": [{
+    "row": 1,
+    "description": "Line description",
+    "accountId": EXPENSE_ACCOUNT_ID,
+    "amountInclVat": AMOUNT_INCL_VAT,
+    "vatTypeId": VAT_TYPE_ID
+  }]
+}
+```
+Query param `sendTo`: "ledger" posts directly, "inbox" puts in inbox for review.
+
+### Supplier Invoice (read): GET /supplierInvoice
 Search params: `invoiceDateFrom`, `invoiceDateTo`, `supplierId`
 Valid fields: `id,invoiceNumber,invoiceDate,invoiceDueDate,amount,amountCurrency,supplier`
 
@@ -439,13 +463,24 @@ IMPORTANT: Each correction voucher must BALANCE (sum=0). Match customer/supplier
 7. PUT /invoice/{id}/:payment?paymentDate=...&paymentTypeId=...&paidAmount=... → for EACH matched customer invoice
 8. Match outgoing payments (negative amounts in CSV) to supplier invoices by amount/reference/supplier name
 9. POST /supplierInvoice/{id}/:addPayment?paymentTypeId=...&amount=...&paidDate=... → for EACH matched supplier invoice
-CRITICAL: For supplier payments, you MUST use /supplierInvoice/{id}/:addPayment — do NOT create manual vouchers via /ledger/voucher. The scoring system checks supplier invoice payment status.
+CRITICAL: For supplier payments, you MUST use /supplierInvoice/{id}/:addPayment — do NOT create manual vouchers via /ledger/voucher and do NOT use /incomingInvoice. The supplier invoices already exist in the system — just register payments against them. The scoring system checks supplier invoice payment status.
 IMPORTANT: Handle partial payments — if CSV amount doesn't exactly match an invoice, it might be a partial payment. Register the exact CSV amount as a partial payment.
 
 **Register supplier invoice payment:**
 1. GET /supplierInvoice?fields=*&count=100 → find supplier invoice
 2. GET /ledger/paymentTypeOut?fields=id,description → get outgoing payment types
 3. POST /supplierInvoice/{id}/:addPayment?paymentTypeId=...&amount=...&paidDate=...
+
+**Register supplier invoice (leverandørfaktura / factura del proveedor / Lieferantenrechnung):**
+When the task says "register supplier invoice" or similar:
+DO NOT use /ledger/voucher. Use /incomingInvoice instead:
+1. GET /supplier?fields=id,name&count=100 → find supplier. If not found, POST /supplier to create it
+2. GET /ledger/account?count=1000&fields=id,number,name → find expense account
+3. GET /ledger/vatType?fields=id,name,percentage&count=100 → find input VAT type
+4. POST /incomingInvoice?sendTo=ledger with body:
+   {"invoiceHeader": {"vendorId": supplier_id, "invoiceDate": "...", "dueDate": "...", "invoiceAmount": total_incl_vat, "description": "...", "invoiceNumber": "INV-..."},
+    "orderLines": [{"row": 1, "description": "...", "accountId": expense_acct_id, "amountInclVat": total_incl_vat, "vatTypeId": vat_type_id}]}
+CRITICAL: Use /incomingInvoice, NOT /ledger/voucher. The scoring checks for proper supplier invoice entities.
 
 **Register expense from receipt/kvittering (image/PDF attached):**
 1. Read the receipt carefully — extract: supplier name, date, total amount (inkl. MVA), item description

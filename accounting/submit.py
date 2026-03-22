@@ -159,12 +159,12 @@ def classify_prompt(prompt):
     """Extract a short task type label from the prompt using keywords."""
     p = prompt.lower()
     categories = [
-        ("bank_reconciliation", ["bankavsteming", "reconciliation", "kontoutskrift", "bank statement"]),
-        ("year_end_closing", ["årsavslutning", "year-end", "year end"]),
+        ("bank_reconciliation", ["bankavsteming", "reconciliation", "kontoutskrift", "bank statement", "concilia", "rapprochement", "abstimmung", "reconciliação", "extracto bancario"]),
+        ("year_end_closing", ["årsavslutning", "year-end", "year end", "clôture annuelle", "cierre anual", "encerramento anual", "jahresabschluss"]),
         ("depreciation", ["avskrivning", "depreciation"]),
         ("tax_provision", ["skattekostnad", "tax provision", "skatt"]),
         ("accrual", ["periodisering", "accrual"]),
-        ("salary", ["lønn", "salary", "payroll", "lønnskjøring"]),
+        ("salary", ["lønn", "salary", "payroll", "lønnskjøring", "gehalt", "gehaltsabrechnung", "salario", "salaire", "nómina"]),
         ("travel_expense", ["reise", "travel", "diett", "per diem", "reiseregning"]),
         ("employee_onboarding", ["onboarding", "ansettelse"]),
         ("employee", ["ansatt", "employee", "empleado", "mitarbeiter"]),
