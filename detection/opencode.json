@@ -2,17 +2,12 @@
   "$schema": "https://opencode.ai/config.json",
   	"watcher": {
 		"ignore": [
-			"accounting/**",
-			"ai-accounting-agent/**",
-			".git/**",
-			"astarIsland/**",
-			"computervision/**",
-			"norgesGruppen/**"
+			"../.git/**"
 		]
 	},
 	"instructions": [
 		"CONTRIBUTING.md",
-		"detection/docs/**",
+		"docs/*.md",
 		".github/instructions/*.md",
 		".github/copilot-instructions.md"
 	],
