@@ -102,6 +102,31 @@ def handle_year_end_closing(tripletex, params):
     if tax_rate:
         revenue = params.get("revenue_total", 0)
         expenses = params.get("expense_total", 0)
+
+        # If revenue/expenses not provided, fetch from ledger
+        if not revenue and not expenses:
+            result = tripletex.get("/ledger/posting", {
+                "dateFrom": f"{year}-01-01", "dateTo": closing_date,
+                "fields": "id,account,amount", "count": 10000,
+            })
+            if result["status_code"] == 200:
+                for post in result["body"].get("values", []):
+                    acct = post.get("account", {})
+                    acct_num = acct.get("number")
+                    if not acct_num:
+                        aid = acct.get("id")
+                        if aid:
+                            for a in accounts:
+                                if a.get("id") == aid:
+                                    acct_num = a.get("number")
+                                    break
+                    if acct_num:
+                        amt = post.get("amount", 0) or 0
+                        if 3000 <= acct_num <= 3999:
+                            revenue += abs(amt)
+                        elif 4000 <= acct_num <= 7999:
+                            expenses += abs(amt)
+
         profit = revenue - expenses - total_depreciation
         if profit > 0:
             tax_amount = round(profit * tax_rate / 100, 2)

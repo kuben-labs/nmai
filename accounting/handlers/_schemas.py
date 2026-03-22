@@ -76,6 +76,7 @@ CUSTOMER_INVOICE_SCHEMA = {
             },
             "department_name": {"type": "string"},
             "project_name": {"type": "string"},
+            "send_invoice": {"type": "boolean", "description": "True if the invoice should be sent/issued after creation"},
         },
         "required": ["customer_name", "order_lines"]
     }

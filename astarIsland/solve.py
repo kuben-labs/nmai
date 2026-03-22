@@ -862,10 +862,79 @@ def predict_ml(models, X):
 # Prediction Building
 # ─────────────────────────────────────────────
 
+def _compute_cross_seed_calibration(all_observations, initial_states, seeds_count,
+                                     height, width, matched, observed_decay, sig,
+                                     lgbm_models, hgbr_models):
+    """Compute calibration factors from observed seeds to transfer to unobserved ones.
+    All seeds share the same hidden parameters, so per-(terrain, distance) calibration
+    factors are transferable across seeds."""
+    # Pool observations from ALL observed seeds
+    pooled_obs = defaultdict(lambda: {"pred": [], "obs_c": np.zeros(N_CLASSES), "obs_t": 0.0})
+
+    for seed_idx in range(seeds_count):
+        obs_list = all_observations.get(seed_idx, [])
+        if not obs_list:
+            continue
+
+        init_grid = grid_to_np(initial_states[seed_idx]["grid"])
+        settlements = settlement_positions(initial_states[seed_idx])
+        dist_map = distance_to_nearest_settlement(height, width, settlements)
+
+        # Build raw prediction (no observations) to compare
+        pred = build_prediction(
+            init_grid, settlements, [],
+            height, width, matched,
+            target_decay=observed_decay, observed_sig=sig,
+            hgbr_models=lgbm_models, rf_models=hgbr_models,
+        )
+
+        # Aggregate this seed's observations
+        obs_counts = np.zeros((height, width, N_CLASSES), dtype=np.float64)
+        obs_total = np.zeros((height, width), dtype=np.float64)
+        for grid_data, vx, vy, vw, vh in obs_list:
+            grid = np.array(grid_data, dtype=np.int8) if isinstance(grid_data, list) else grid_data
+            for dy in range(vh):
+                for dx in range(vw):
+                    y, x = vy + dy, vx + dx
+                    if y >= height or x >= width:
+                        continue
+                    cls = TERRAIN_TO_CLASS.get(int(grid[dy][dx] if isinstance(grid[dy], list) else grid[dy, dx]), 0)
+                    obs_counts[y, x, cls] += 1.0
+                    obs_total[y, x] += 1.0
+
+        # Group by (terrain, distance_bucket)
+        for y in range(height):
+            for x in range(width):
+                if obs_total[y, x] == 0 or init_grid[y, x] in STATIC_TERRAINS:
+                    continue
+                terrain = int(init_grid[y, x])
+                db = dist_bucket(int(dist_map[y, x]))
+                key = (terrain, db)
+                pooled_obs[key]["pred"].append(pred[y, x])
+                pooled_obs[key]["obs_c"] += obs_counts[y, x]
+                pooled_obs[key]["obs_t"] += obs_total[y, x]
+
+    # Compute calibration factors from pooled data
+    cross_cal = {}
+    for key, data in pooled_obs.items():
+        if data["obs_t"] < 10:
+            continue
+        pred_arr = np.array(data["pred"])
+        obs_freq = data["obs_c"] / data["obs_t"]
+        pred_mean = pred_arr.mean(axis=0)
+        cal = np.ones(N_CLASSES)
+        for c in range(N_CLASSES):
+            if pred_mean[c] > 0.002:
+                cal[c] = np.clip(obs_freq[c] / pred_mean[c], 0.3, 3.0)
+        cross_cal[key] = cal
+
+    return cross_cal
+
+
 def build_prediction(initial_grid_np, settlements, obs_list, height, width,
                      matched_rounds, prior_strength=15.0, target_decay=None,
                      observed_sig=None, hgbr_models=None, rf_models=None,
-                     ensemble_alpha=0.5):
+                     ensemble_alpha=0.5, cross_seed_cal=None):
     """
     Build H×W×6 prediction using matched round priors + observations.
     If target_decay is provided, rescale settlement probabilities per distance
@@ -973,41 +1042,7 @@ def build_prediction(initial_grid_np, settlements, obs_list, height, width,
                     prediction[y, x] = (ensemble_alpha * prediction[y, x]
                                         + (1 - ensemble_alpha) * hgbr_preds[i])
 
-    # ── Observation-based calibration ──
-    # Compare model predictions on observed cells vs observations,
-    # then adjust all predictions to correct systematic bias
-    has_obs = obs_total > 0
-    n_obs_cells = int(has_obs.sum())
-    if n_obs_cells >= 20:
-        # Compute observed class frequencies on dynamic observed cells
-        dynamic_obs_mask = has_obs & ~np.isin(initial_grid_np, list(STATIC_TERRAINS))
-        n_dynamic_obs = int(dynamic_obs_mask.sum())
-        if n_dynamic_obs >= 20:
-            pred_on_obs = prediction[dynamic_obs_mask]  # (n, 6)
-            obs_freq = (obs_counts[dynamic_obs_mask] /
-                        obs_total[dynamic_obs_mask, np.newaxis])  # (n, 6)
-
-            # Per-class mean: predicted vs observed
-            pred_mean = pred_on_obs.mean(axis=0)
-            obs_mean = obs_freq.mean(axis=0)
-
-            # Compute calibration factors for classes 1-4 (skip 0=empty, 5=mountain)
-            cal_factors = np.ones(N_CLASSES)
-            for c in [1, 2, 3, 4]:
-                if pred_mean[c] > 0.002:
-                    cal_factors[c] = np.clip(obs_mean[c] / pred_mean[c], 0.5, 2.0)
-
-            # Apply calibration to all dynamic cells
-            dynamic_mask = ~np.isin(initial_grid_np, list(STATIC_TERRAINS))
-            for y in range(height):
-                for x in range(width):
-                    if not dynamic_mask[y, x]:
-                        continue
-                    prediction[y, x, 1:5] *= cal_factors[1:5]
-                    prediction[y, x] = np.maximum(prediction[y, x], PROB_FLOOR)
-                    prediction[y, x] /= prediction[y, x].sum()
-
-    # ── Dirichlet updating with observations ──
+    # ── Dirichlet updating with observations (fixed prior_strength) ──
     for y in range(height):
         for x in range(width):
             if obs_total[y, x] > 0 and initial_grid_np[y, x] not in STATIC_TERRAINS:
@@ -1083,11 +1118,9 @@ def cmd_solve(session, round_data=None, dry_run=False, do_submit=True):
     viewports = make_viewport_grid(width, height)
     n_vp = len(viewports)
     queries_available = queries_remaining
-    # How many viewport batches can we afford? Each batch = seeds_count queries
     max_batches = queries_available // seeds_count
     n_batches = min(max_batches, n_vp)
     vps_to_use = viewports[:n_batches]
-    # Extra queries for re-observation of remaining viewports
     leftover = queries_available - n_batches * seeds_count
 
     print(f"Viewport grid: {n_vp} viewports, using {n_batches} batches "
@@ -1097,7 +1130,6 @@ def cmd_solve(session, round_data=None, dry_run=False, do_submit=True):
 
     if dry_run:
         print("(dry run — not executing)")
-        # Show what matching would look like with no observations
         return
 
     # ── Execute queries: cycle through seeds per viewport ──
@@ -1122,7 +1154,6 @@ def cmd_solve(session, round_data=None, dry_run=False, do_submit=True):
                   f"[{query_count}/{result['queries_max']}]")
             time.sleep(0.22)
 
-        # After each batch, show activity estimate
         if (vp_idx + 1) % 2 == 0 or vp_idx == n_batches - 1:
             sig = estimate_activity_from_observations(
                 all_observations, initial_states, seeds_count, height, width)
@@ -1137,7 +1168,6 @@ def cmd_solve(session, round_data=None, dry_run=False, do_submit=True):
     # ── Use leftover queries for extra observations ──
     if leftover > 0:
         print(f"\n── {leftover} extra queries ──")
-        # Distribute across seeds, re-observing first viewports (most dynamic)
         extra_vp_idx = 0
         for q in range(leftover):
             seed_idx = q % seeds_count
@@ -1218,7 +1248,6 @@ def cmd_solve(session, round_data=None, dry_run=False, do_submit=True):
             print(f"{result.get('status', result)}")
             time.sleep(0.5)
         else:
-            # Estimate score based on prediction entropy
             ent = -np.sum(pred * np.log(pred + 1e-15), axis=-1)
             mean_ent = ent[ent > 0.001].mean() if (ent > 0.001).any() else 0
             print(f"\nSeed {seed_idx}: predicted (not submitted). "
@@ -1535,7 +1564,6 @@ def cmd_resubmit(session, round_data=None, do_submit=False):
 
     # ── Build final predictions with proven defaults ──
     a_look, a_lgbm, a_hgbr = wc
-    cal_lo, cal_hi = cal_clip
     final_preds = {}
 
     for seed_idx, sd in enumerate(seed_data):
@@ -1545,24 +1573,14 @@ def cmd_resubmit(session, round_data=None, do_submit=False):
                     + a_lgbm * sd["lgbm"][dm]
                     + a_hgbr * sd["hgbr"][dm])
 
-        # Calibration
-        om = sd["obs_mask"]
-        if int(om.sum()) >= 20:
-            obs_freq = sd["obs_counts"][om] / sd["obs_total"][om, np.newaxis]
-            pred_mean = pred[om].mean(axis=0)
-            obs_mean = obs_freq.mean(axis=0)
-            cal = np.ones(N_CLASSES)
-            for c in [1, 2, 3, 4]:
-                if pred_mean[c] > 0.002:
-                    cal[c] = np.clip(obs_mean[c] / pred_mean[c], cal_lo, cal_hi)
-            pred[dm, 1:5] *= cal[np.newaxis, 1:5]
-            pred[dm] = np.maximum(pred[dm], 1e-8)
-            pred[dm] /= pred[dm].sum(axis=-1, keepdims=True)
-
-        # Dirichlet update
-        alpha = pred[om] * ps
-        posterior = alpha + sd["obs_counts"][om]
-        pred[om] = posterior / posterior.sum(axis=-1, keepdims=True)
+        # Fixed Dirichlet update with ps=15
+        for y in range(height):
+            for x in range(width):
+                n = sd["obs_total"][y, x]
+                if n > 0 and sd["dynamic_mask"][y, x]:
+                    alpha = pred[y, x] * ps
+                    posterior = alpha + sd["obs_counts"][y, x]
+                    pred[y, x] = posterior / posterior.sum()
 
         pred = np.maximum(pred, floor)
         pred /= pred.sum(axis=-1, keepdims=True)

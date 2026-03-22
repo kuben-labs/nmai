@@ -1,6 +1,6 @@
 ZONE=us-central1-f
 PROJECT=ai-nm26osl-1759
-VM=yolo-train
+VM=yolo-train-a100
 
 # ---- GCP ----
 

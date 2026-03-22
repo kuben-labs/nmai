@@ -753,5 +753,23 @@
       "Check 4: failed"
     ],
     "result": "FAIL"
+  },
+  {
+    "id": "e1c4a784-9445-46fa-9845-80d150c56be8",
+    "timestamp": "2026-03-22T12:59:34.138931+00:00",
+    "status": "completed",
+    "score_raw": 6.0,
+    "score_max": 7.0,
+    "normalized_score": 0.8571,
+    "comment": "1/5 checks failed.",
+    "task_type": "unknown",
+    "prompt": "Crea y envía una factura al cliente Viento SL (org. nº 844876831) por 35350 NOK sin IVA. La factura es por Licencia de software.",
+    "file_count": 0,
+    "checks_passed": 4,
+    "checks_total": 5,
+    "failed_checks": [
+      "Check 4: failed"
+    ],
+    "result": "PARTIAL"
   }
 ]

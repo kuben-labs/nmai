@@ -1,6 +1,6 @@
 ZONE=us-central1-f
 PROJECT=ai-nm26osl-1759
-VM=yolo-train
+VM=yolo-train-a100
 
 # ---- GCP ----
 
@@ -41,6 +41,11 @@ train-yolo:
 train-yolo11:
 	pip install ultralytics --upgrade
 	python3 train_yolo11.py --model yolo11x --epochs 300 --imgsz 1280 --batch 8 --device 0
+
+train-v2:
+	pip install ultralytics --upgrade
+	python3 train_yolo11.py --model yolo11x --epochs 300 --imgsz 1280 --batch -1 --device 0 \
+		--name yolo11x_v2 --patience 30
 
 train-classifier:
 	python3 train_classifier.py --epochs 50 --batch 64 --img_size 256 --device 0

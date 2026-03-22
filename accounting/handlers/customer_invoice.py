@@ -110,4 +110,20 @@ def handle_customer_invoice(tripletex, params):
 
     invoice_id = result["body"].get("value", {}).get("id")
     logger.info(f"Invoice created: id={invoice_id}, order={order_id}")
+
+    # Send/issue the invoice if requested
+    if params.get("send_invoice") and invoice_id:
+        send_result = tripletex.put(
+            f"/invoice/{invoice_id}/:send?sendType=EMAIL&overrideEmailAddress={params.get('customer_email', '')}",
+            {}
+        )
+        if send_result["status_code"] not in (200, 201, 204):
+            # Try alternative: just mark as sent
+            send_result = tripletex.put(
+                f"/invoice/{invoice_id}/:send?sendType=EFAKTURA",
+                {}
+            )
+            if send_result["status_code"] not in (200, 201, 204):
+                logger.warning(f"Invoice send failed: {send_result['status_code']}")
+
     return {"success": True, "invoice_id": invoice_id, "order_id": order_id}

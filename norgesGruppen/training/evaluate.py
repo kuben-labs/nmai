@@ -67,15 +67,19 @@ def compute_map50(coco_gt, predictions, class_agnostic=False):
         coco_gt_mod = coco_gt
         preds_mod = predictions
 
+    import numpy as np
     coco_dt = coco_gt_mod.loadRes(preds_mod)
     coco_eval = COCOeval(coco_gt_mod, coco_dt, "bbox")
-    coco_eval.params.iouThrs = [0.5]  # only IoU=0.5
     coco_eval.evaluate()
     coco_eval.accumulate()
-    coco_eval.summarize()
 
-    # stats[0] = AP @ IoU=0.5 (since we only set that threshold)
-    return float(coco_eval.stats[0])
+    # Read mAP@50 directly from precision array to avoid summarize() numpy bug
+    # precision shape: [T, R, K, A, M] — T=iou thresholds, R=recall, K=cats, A=area, M=maxDets
+    p = coco_eval.eval["precision"]
+    # IoU=0.5 is index 0 in default thresholds [0.5, 0.55, ..., 0.95]
+    ap50 = np.mean(p[0, :, :, 0, -1][p[0, :, :, 0, -1] > -1])
+    print(f" Average Precision (AP) @[ IoU=0.50 | area=all | maxDets=100 ] = {ap50:.3f}")
+    return float(ap50)
 
 
 def main():

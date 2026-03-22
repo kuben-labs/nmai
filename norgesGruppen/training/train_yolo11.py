@@ -32,6 +32,9 @@ def parse_args():
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--device", default="0")
+    p.add_argument("--name", default=None,
+                   help="Experiment name (default: {model}_ngd)")
+    p.add_argument("--patience", type=int, default=30)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--export-only", default=None,
                    help="Skip training, just export this .pt to ONNX")
@@ -75,6 +78,7 @@ def main():
         model.train(resume=True)
     else:
         weights = args.weights if args.weights else f"{args.model}.pt"
+        run_name = args.name if args.name else f"{args.model}_ngd"
         model = YOLO(weights)
         model.train(
             data=args.data,
@@ -84,29 +88,38 @@ def main():
             workers=args.workers,
             device=args.device,
             project=str(RUNS_DIR),
-            name=f"{args.model}_ngd",
+            name=run_name,
 
-            # ── Augmentation (minimal — heavy aug can hurt on dense shelves) ──
+            # ── Augmentation ──
             hsv_h=0.015,
-            hsv_s=0.4,
-            hsv_v=0.3,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            degrees=5.0,
+            translate=0.1,
+            scale=0.5,
+            shear=2.0,
+            flipud=0.0,
             fliplr=0.5,
             mosaic=1.0,
-            mixup=0.0,
-            copy_paste=0.0,
+            mixup=0.1,
+            copy_paste=0.1,
 
             # ── Schedule ──
+            optimizer="AdamW",
+            lr0=0.001,
+            lrf=0.01,
+            weight_decay=0.0005,
+            warmup_epochs=5,
             cos_lr=True,
-            patience=50,
-            close_mosaic=30,
-
-            # ── Loss ──
-            cls=1.0,
-            label_smoothing=0.1,
+            patience=args.patience,
+            close_mosaic=15,
+            amp=True,
 
             # ── Other ──
             save=True,
+            save_period=10,
             plots=True,
+            verbose=True,
         )
 
     # Auto-export best weights to ONNX
