@@ -58,8 +58,10 @@ CUSTOMER (Customer_post):
 
 ORDER (Order_post):
   REQUIRED: customer: {id: N}, orderDate, deliveryDate
-  INLINE ORDER LINES: orderLines: [{product: {id: N}, count: 1, unitPriceExcludingVatCurrency: 1000, vatType: {id: vat_id}}]
-  CRITICAL: If you pass orderLines in Order_post, do NOT also call OrderOrderline_post for the same lines. That creates duplicates and doubles the invoice amount.
+  ORDER LINES — choose ONE method, never both:
+    Method A (preferred): Pass orderLines INLINE in Order_post. Then go straight to invoicing. Do NOT call OrderOrderline_post.
+    Method B: Create order WITHOUT orderLines, then add lines via OrderOrderline_post separately.
+  NEVER use both methods. If you passed orderLines in Order_post, the lines already exist. Calling OrderOrderline_post after will DUPLICATE them.
   VAT HANDLING:
     - When using existing products (found via Product_search), do NOT override vatType — the product already has VAT configured. Just pass product: {id} without vatType.
     - When creating description-only order lines (no product), ALWAYS set vatType explicitly. Default to 25% standard MVA (id: 3).
