@@ -196,37 +196,3 @@ class TripletexClient:
         except Exception as e:
             logger.error(f"DELETE {path} error: {e}")
             return {"error": True, "message": str(e)}
-
-
-# Global client instance (set per request)
-_current_client: Optional[TripletexClient] = None
-
-
-def set_tripletex_client(base_url: str, session_token: str) -> TripletexClient:
-    """
-    Set the global Tripletex client for the current request.
-
-    Args:
-        base_url: Tripletex API base URL
-        session_token: Session token
-
-    Returns:
-        The configured client
-    """
-    global _current_client
-    _current_client = TripletexClient(base_url, session_token)
-    logger.info(f"Tripletex client configured for: {base_url}")
-    return _current_client
-
-
-def get_tripletex_client() -> Optional[TripletexClient]:
-    """Get the current Tripletex client."""
-    return _current_client
-
-
-async def cleanup_tripletex_client():
-    """Clean up the current Tripletex client."""
-    global _current_client
-    if _current_client:
-        await _current_client.close()
-        _current_client = None

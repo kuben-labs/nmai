@@ -13,16 +13,13 @@ from dotenv import load_dotenv
 
 from .coordinator import run_accounting_task
 from .file_processor import FileProcessor
-# TripletexClient is unused - all API calls go through MCP tools
-# Keeping import available for future use if needed
 
 # Load environment variables
 load_dotenv()
 
-# Concurrency guard: serialize /solve requests to prevent credential conflicts
-# The MCP server uses global credentials, so concurrent requests with different
-# credentials would overwrite each other. This lock ensures one task at a time.
-_solve_lock = asyncio.Lock()
+# Track concurrent /solve requests for observability
+_active_requests = 0
+_active_requests_lock = asyncio.Lock()
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -118,14 +115,12 @@ async def solve(request: Request):
     logger.info(f"[{request_id}] 📤 RECEIVED REQUEST FROM COMPETITION")
     logger.info(f"{'=' * 80}")
 
-    # Serialize requests to prevent credential conflicts in the MCP server.
-    # The MCP server uses process-global credentials, so concurrent requests
-    # with different credentials would overwrite each other.
-    if _solve_lock.locked():
-        logger.warning(
-            f"[{request_id}] ⚠ Another /solve request is in progress, waiting for lock..."
-        )
-    await _solve_lock.acquire()
+    global _active_requests
+    async with _active_requests_lock:
+        _active_requests += 1
+        current = _active_requests
+    logger.info(f"[{request_id}] Active /solve requests: {current}")
+
     try:
         # Parse request and log the FULL body for debugging
         body = await request.json()
@@ -301,7 +296,11 @@ async def solve(request: Request):
         )
 
     finally:
-        _solve_lock.release()
+        async with _active_requests_lock:
+            _active_requests -= 1
+        logger.info(
+            f"[{request_id}] /solve finished. Active requests: {_active_requests}"
+        )
 
 
 # ============================================================================

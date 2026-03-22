@@ -6,7 +6,6 @@ services:
     ports:
       - 8080:8080
     restart: unless-stopped
-    container_name: ai-accountant-agent
 
     ## resources limits 8GB memory and 2 CPU
     deploy:

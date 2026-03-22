@@ -7,6 +7,7 @@ Direct OpenAPI tools architecture (no MCP):
 - No separate MCP server process needed
 """
 
+import asyncio
 import json
 import os
 import traceback
@@ -35,10 +36,12 @@ from .prompts import (
 from .rag_tool_manager import create_rag_tool_manager
 from .openapi_tools import generate_tools_from_openapi, fetch_openapi_spec
 
-# Module-level caches
+# Module-level caches (protected by narrow init locks for concurrent requests)
 _rag_manager = None
 _rag_initialized = False
+_rag_init_lock = asyncio.Lock()
 _openapi_spec_cache: Optional[Dict[str, Any]] = None
+_openapi_spec_lock = asyncio.Lock()
 _tools_cache: Dict[str, List[Tool]] = {}  # keyed by base_url+token hash
 
 
@@ -144,53 +147,67 @@ async def _get_openapi_spec(base_url: str, session_token: str) -> Dict[str, Any]
 
     We fetch the spec from the sandbox URL (always available) and cache it.
     The spec is the same regardless of which Tripletex instance we connect to.
+    Thread-safe: uses _openapi_spec_lock to prevent duplicate fetches.
     """
     global _openapi_spec_cache
 
+    # Fast path: no lock needed if already cached
     if _openapi_spec_cache is not None:
         return _openapi_spec_cache
 
-    # Fetch from sandbox (always available, spec is universal)
-    import os
+    async with _openapi_spec_lock:
+        # Double-check after acquiring lock (another coroutine may have filled it)
+        if _openapi_spec_cache is not None:
+            return _openapi_spec_cache
 
-    sandbox_url = os.getenv("API_URL", "https://kkpqfuj-amager.tripletex.dev/v2")
-    sandbox_token = os.getenv("SESSION_TOKEN", "")
+        # Fetch from sandbox (always available, spec is universal)
+        sandbox_url = os.getenv("API_URL", "https://kkpqfuj-amager.tripletex.dev/v2")
+        sandbox_token = os.getenv("SESSION_TOKEN", "")
 
-    try:
-        spec = await fetch_openapi_spec(sandbox_url, sandbox_token)
-        _openapi_spec_cache = spec
-        logger.info(f"Fetched OpenAPI spec: {len(spec.get('paths', {}))} paths")
-        return spec
-    except Exception as e:
-        logger.error(f"Failed to fetch OpenAPI spec: {e}")
-        raise
+        try:
+            spec = await fetch_openapi_spec(sandbox_url, sandbox_token)
+            _openapi_spec_cache = spec
+            logger.info(f"Fetched OpenAPI spec: {len(spec.get('paths', {}))} paths")
+            return spec
+        except Exception as e:
+            logger.error(f"Failed to fetch OpenAPI spec: {e}")
+            raise
 
 
 async def _get_rag_manager():
-    """Get or create the shared RAG manager (cached across requests)."""
+    """Get or create the shared RAG manager (cached across requests).
+
+    Thread-safe: uses _rag_init_lock to prevent duplicate initialization.
+    """
     global _rag_manager, _rag_initialized
 
+    # Fast path: no lock needed if already initialized
     if _rag_manager is not None and _rag_initialized:
         return _rag_manager
 
-    logger.info("Initializing shared RAG tool manager...")
+    async with _rag_init_lock:
+        # Double-check after acquiring lock
+        if _rag_manager is not None and _rag_initialized:
+            return _rag_manager
 
-    try:
-        embedding_provider = get_embedding_provider()
-        logger.debug("Using Google embedding provider")
-    except Exception as e:
-        logger.warning(f"Could not load embedding provider: {e}")
-        embedding_provider = None
+        logger.info("Initializing shared RAG tool manager...")
 
-    top_k = int(os.getenv("TOP_K", "200"))
-    _rag_manager = create_rag_tool_manager(
-        embedding_provider=embedding_provider,
-        top_k=top_k,
-    )
-    await _rag_manager.initialize()
-    _rag_initialized = True
+        try:
+            embedding_provider = get_embedding_provider()
+            logger.debug("Using Google embedding provider")
+        except Exception as e:
+            logger.warning(f"Could not load embedding provider: {e}")
+            embedding_provider = None
 
-    return _rag_manager
+        top_k = int(os.getenv("TOP_K", "200"))
+        _rag_manager = create_rag_tool_manager(
+            embedding_provider=embedding_provider,
+            top_k=top_k,
+        )
+        await _rag_manager.initialize()
+        _rag_initialized = True
+
+        return _rag_manager
 
 
 async def _get_relevant_tool_names(task_prompt: str, spec: Dict[str, Any]) -> Set[str]:

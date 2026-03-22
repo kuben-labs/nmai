@@ -1,4 +1,4 @@
-.PHONY: help dev dev-agent install clean kill-ports test-health
+.PHONY: help dev dev-agent prod install clean kill-ports test-health
 
 # Colors for output
 BLUE := \033[0;34m
@@ -39,9 +39,13 @@ help: ## Show this help message
 # Development commands
 dev: kill-ports dev-agent ## Start the agent server (direct API mode, no MCP)
 
-dev-agent: ## Start Agent server
-	@echo "$(BLUE)Starting Agent server on $(AGENT_URL) (direct API mode)...$(NC)"
+dev-agent: ## Start Agent server (single worker, hot-reload)
+	@echo "$(BLUE)Starting Agent server on $(AGENT_URL) (direct API mode, hot-reload)...$(NC)"
 	@uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --reload
+
+prod: kill-ports ## Start Agent server for production (4 workers, no reload)
+	@echo "$(BLUE)Starting Agent server on $(AGENT_URL) (production, 4 workers)...$(NC)"
+	@uv run uvicorn src.ai_accounting_agent.http_server:app --host 0.0.0.0 --port 8080 --workers 4
 
 kill-ports: ## Free development ports
 	@echo "$(YELLOW)Freeing development ports (8080)...$(NC)"
