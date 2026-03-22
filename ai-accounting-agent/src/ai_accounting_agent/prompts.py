@@ -59,6 +59,7 @@ ORDER (Order_post):
   REQUIRED: customer: {id: N}, orderDate, deliveryDate
   INLINE ORDER LINES: orderLines: [{product: {id: N}, count: 1, unitPriceExcludingVatCurrency: 1000, vatType: {id: vat_id}}]
   CRITICAL: ALWAYS include vatType on every order line. Search LedgerVatType_search({}) first to get VAT type IDs.
+  CRITICAL: If you pass orderLines in Order_post, do NOT also call OrderOrderline_post for the same lines. That creates duplicates and doubles the invoice amount.
   COMMON VAT TYPES (search to confirm exact IDs for each account):
     - 25% standard MVA (most services/products) — typically id=3, number="3"
     - 15% food MVA (næringsmiddel) — typically id=33, number="33"
