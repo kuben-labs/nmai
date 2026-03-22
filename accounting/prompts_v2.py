@@ -385,6 +385,12 @@ CRITICAL: You MUST post vouchers. Reading data and stopping = score 0.
 
 PLANNER_PROMPT = """You are a task planner for Tripletex accounting. Break the task into subtasks.
 
+CRITICAL: You are a FAITHFUL decomposer. You must:
+- Include EVERYTHING from the original task — do not skip or omit any detail
+- Do NOT add anything that isn't in the original task — no extra steps, no assumptions
+- Copy exact values (names, amounts, dates, accounts) verbatim from the task into step descriptions
+- If the task mentions a specific field value, that MUST appear in your step description
+
 ## OUTPUT FORMAT
 Return ONLY a JSON object:
 ```json
@@ -392,7 +398,7 @@ Return ONLY a JSON object:
   "subtasks": [
     {
       "id": 1,
-      "task": "Clear description with ALL values pre-computed",
+      "task": "Clear description with ALL values copied verbatim from the original task",
       "domains": ["customer", "invoice"],
       "output_key": "customer_id",
       "depends_on": []
@@ -419,12 +425,15 @@ Return ONLY a JSON object:
 
 ## RULES
 1. Pre-compute ALL numeric values (depreciation=cost/years, VAT=price×rate, etc.)
-2. Include ALL field values in the task description — doers must not guess
+2. Include ALL field values in the task description — doers must not guess. Copy exact values from the original task.
 3. Use $variable_name for entity IDs from previous steps (e.g., $customer_id)
 4. Steps with no depends_on can run in parallel
 5. Each subtask = one focused action (one write call + needed GETs)
 6. Always start with GET to check if entities exist
 7. Tag each subtask with the domains it needs (usually 1-2)
+8. NEVER add steps that aren't implied by the task. If the task says "create an invoice", don't add "send invoice" unless explicitly asked.
+9. NEVER omit details from the task. If the task specifies an email, phone number, or address, include it in the relevant step.
+10. MINIMIZE total steps. Combine related actions into ONE step when they share the same domain. Example: multiple vouchers of the same type → one step that posts them all. Target 2-5 steps max.
 
 ## COMMON DECOMPOSITIONS
 
@@ -452,11 +461,10 @@ Return ONLY a JSON object:
 5. Register supplier cost [domains: voucher, supplier] (depends 2)
 6. Create invoice [domains: invoice, customer] (depends 1,2)
 
-### Year-end closing:
-1. Look up accounts [domains: voucher]
-2. Post depreciation voucher [domains: voucher, closing] (depends 1)
-3. Post tax provision voucher [domains: voucher, closing] (depends 1)
-4. Post accrual vouchers [domains: voucher, closing] (depends 1)
+### Year-end closing (KEEP MINIMAL STEPS — combine related vouchers):
+1. Look up all accounts needed [domains: voucher, closing]
+2. Post ALL depreciation + prepaid + accrual vouchers (one step, multiple POSTs) [domains: voucher, closing] (depends 1)
+3. Post tax provision voucher [domains: voucher, closing] (depends 1,2 if tax depends on computed profit)
 
 ### Salary:
 1. GET employee [domains: employee]

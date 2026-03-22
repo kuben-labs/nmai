@@ -1,0 +1,41 @@
+[
+  {
+    "id": "9a1b753a-2f12-441e-bebc-0961da0952aa",
+    "timestamp": "2026-03-22T04:54:46.465722Z",
+    "status": "completed",
+    "score_raw": 6.0,
+    "score_max": 11.0,
+    "normalized_score": 1.6364,
+    "comment": "3/7 checks failed.",
+    "task_type": "3/7 checks failed.",
+    "checks_passed": 4,
+    "checks_total": 7,
+    "failed_checks": [
+      "Check 3: failed",
+      "Check 4: failed",
+      "Check 5: failed"
+    ],
+    "result": "PARTIAL"
+  },
+  {
+    "id": "ad6814f3-122a-4a5c-9183-47f22ba213cc",
+    "timestamp": "2026-03-22T05:08:45.794400+00:00",
+    "status": "completed",
+    "score_raw": 3.0,
+    "score_max": 10.0,
+    "normalized_score": 0.9,
+    "comment": "4/5 checks failed.",
+    "task_type": "voucher",
+    "prompt": "Os custos totais aumentaram significativamente de janeiro a fevereiro de 2026. Analise o livro razão e identifique as três contas de despesa com o maior aumento em valor. Crie um projeto interno para cada uma das três contas com o nome da conta. Também crie uma atividade para cada projeto.",
+    "file_count": 0,
+    "checks_passed": 1,
+    "checks_total": 5,
+    "failed_checks": [
+      "Check 1: failed",
+      "Check 2: failed",
+      "Check 3: failed",
+      "Check 4: failed"
+    ],
+    "result": "PARTIAL"
+  }
+]

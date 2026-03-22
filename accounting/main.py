@@ -57,6 +57,16 @@ async def solve(request: Request):
     logger.info(f"Received task: {prompt[:200]}...")
     logger.info(f"Files: {len(files)}, Base URL: {base_url}")
 
+    # Structured log for task tracking — full prompt so we can correlate with scoring results
+    import json as _json
+    task_input_log = _json.dumps({
+        "tag": "TASK_INPUT",
+        "prompt": prompt[:3000],
+        "file_count": len(files),
+        "file_names": [f.get("filename", "") for f in files],
+    }, ensure_ascii=False)
+    logger.info(task_input_log)
+
     import asyncio
     from agent import run_agent
 

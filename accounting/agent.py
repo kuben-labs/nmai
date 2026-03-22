@@ -1,19 +1,26 @@
-"""Claude-powered agentic loop for Tripletex accounting tasks."""
+"""Claude-powered planner-executor agent for Tripletex accounting tasks.
+
+Architecture:
+1. Planner (1 call): Breaks task into subtasks, tags each with domains
+2. Executor (fresh chat per step): Gets ONLY the API docs for tagged domains
+3. Context passing: Entity IDs flow between steps via $variable substitution
+"""
 
 import json
 import logging
 import base64
 import os
+import re
 from datetime import date, datetime
 
 import anthropic
 
 from tripletex import TripletexClient
-from prompts_v2 import DOMAINS, build_doer_prompt, FILE_HANDLING_PROMPT
+from prompts_v2 import DOMAINS, build_doer_prompt, PLANNER_PROMPT, FILE_HANDLING_PROMPT
 
 logger = logging.getLogger(__name__)
 
-# Keywords → domain mapping for task classification
+# Keywords → domain mapping for task classification (fallback if planner doesn't tag)
 DOMAIN_KEYWORDS = {
     "customer": ["kunde", "customer", "client", "cliente", "kundefaktura"],
     "supplier": ["leverandør", "supplier", "fournisseur", "proveedor", "fornecedor", "lieferant",
@@ -50,7 +57,6 @@ DOMAIN_KEYWORDS = {
                 "skattekostnad", "tax provision", "skatt"],
 }
 
-# Domains that should co-include other domains
 DOMAIN_DEPS = {
     "travel": ["employee"],
     "salary": ["employee"],
@@ -61,47 +67,19 @@ DOMAIN_DEPS = {
 }
 
 
-VERIFY_PROMPT = """VERIFICATION CHECK: Before finishing, verify your work:
-1. GET back the key entities you created/modified
-2. Compare each field against the original task requirements
-3. Check: correct amounts? correct dates? correct names? correct accounts? correct department/project links?
-4. If a field is wrong, fix it with PUT (do NOT delete and recreate)
-5. If everything is correct, confirm and stop
+STEP_PREFIX = """You are executing a single focused subtask in Tripletex.
+Complete ONLY the described subtask — nothing more, nothing less.
+Use EXACTLY the values specified in the subtask description. Do not add fields or steps not mentioned.
 
-IMPORTANT: Do NOT delete any entities during verification. Only use PUT to fix wrong values. Do this now — GET the entities and verify."""
-
-
-def classify_task(prompt: str, has_files: bool) -> list[str]:
-    """Classify task into relevant domains using keyword matching."""
-    prompt_lower = prompt.lower()
-    domains = set()
-
-    for domain, keywords in DOMAIN_KEYWORDS.items():
-        if any(kw in prompt_lower for kw in keywords):
-            domains.add(domain)
-
-    # Receipt/expense from attached image → need supplier + department + voucher
-    if has_files and domains & {"voucher"}:
-        domains.update(["supplier", "department"])
-
-    # Project lifecycle often needs invoice + supplier for costs
-    if "project" in domains and any(w in prompt_lower for w in ["faktura", "invoice", "kostnad", "cost"]):
-        domains.update(["invoice", "customer", "supplier", "voucher"])
-
-    # Invoice tasks need customer
-    if "invoice" in domains:
-        domains.add("customer")
-
-    # Add dependency domains
-    for domain in list(domains):
-        if domain in DOMAIN_DEPS:
-            domains.update(DOMAIN_DEPS[domain])
-
-    # Fallback: if nothing matched, include common domains
-    if not domains:
-        domains = set(DOMAINS.keys())
-
-    return sorted(domains)
+RULES:
+- GET calls are free — use them to look up IDs before writes
+- Make exactly the write calls described in this subtask — no more, no fewer
+- If the subtask says to create multiple entities, create them all in this step
+- $variable references have been replaced with actual IDs in the context below
+- If a GET returns existing entities, use their IDs — don't create duplicates
+- Use the EXACT names, amounts, dates, and values from the subtask description
+- When done, stop. Do not continue to other tasks.
+"""
 
 
 TOOLS = [
@@ -227,7 +205,6 @@ def build_user_message(prompt: str, files: list) -> list:
     """Build the user message content blocks, including images and PDFs for vision."""
     content_blocks = []
 
-    # Add files as native content blocks (vision/document)
     for f in files:
         mime_type = f.get("mime_type", "")
         if mime_type and mime_type.startswith("image/"):
@@ -249,7 +226,6 @@ def build_user_message(prompt: str, files: list) -> list:
                 }
             })
 
-    # Build the text part
     file_text = extract_file_content(files)
     today = date.today().isoformat()
     text = f"Today's date is {today}.\n\nTASK:\n{prompt}"
@@ -275,13 +251,10 @@ def execute_tool(client: TripletexClient, tool_name: str, tool_input: dict) -> s
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
         result_str = json.dumps(result, default=str, ensure_ascii=False)
-        # Truncate very large responses but keep useful info
-        # Use higher limit for GET (free) vs write calls
         max_len = 50000 if tool_name == "tripletex_get" else 15000
         if len(result_str) > max_len:
             if "body" in result and "values" in result.get("body", {}):
                 values = result["body"]["values"]
-                # For GETs, keep more results to avoid repeated lookups
                 keep = 100 if tool_name == "tripletex_get" else 20
                 if len(values) > keep:
                     result["body"]["values"] = values[:keep]
@@ -296,211 +269,292 @@ def execute_tool(client: TripletexClient, tool_name: str, tool_input: dict) -> s
         return json.dumps({"error": str(e)})
 
 
-def structure_task(client, model: str, user_content: list) -> str:
-    """Phase 1: Call the structurer model to extract and organize task info."""
-    try:
+def classify_task(prompt: str, has_files: bool) -> list[str]:
+    """Classify task into relevant domains using keyword matching."""
+    prompt_lower = prompt.lower()
+    domains = set()
+
+    for domain, keywords in DOMAIN_KEYWORDS.items():
+        if any(kw in prompt_lower for kw in keywords):
+            domains.add(domain)
+
+    if has_files and domains & {"voucher"}:
+        domains.update(["supplier", "department"])
+
+    if "project" in domains and any(w in prompt_lower for w in ["faktura", "invoice", "kostnad", "cost"]):
+        domains.update(["invoice", "customer", "supplier", "voucher"])
+
+    if "invoice" in domains:
+        domains.add("customer")
+
+    for domain in list(domains):
+        if domain in DOMAIN_DEPS:
+            domains.update(DOMAIN_DEPS[domain])
+
+    if not domains:
+        domains = set(DOMAINS.keys())
+
+    return sorted(domains)
+
+
+def create_plan(client, model: str, prompt: str, files: list) -> list:
+    """Call the planner to break the task into subtasks."""
+    user_content = build_user_message(prompt, files)
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=PLANNER_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    # Parse JSON — handle markdown code blocks
+    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if json_match:
+        plan_data = json.loads(json_match.group(1))
+    else:
+        plan_data = json.loads(text.strip())
+
+    subtasks = plan_data.get("subtasks", [])
+
+    # Validate and normalize
+    for s in subtasks:
+        if "id" not in s:
+            s["id"] = subtasks.index(s) + 1
+        if "depends_on" not in s:
+            s["depends_on"] = []
+        if "output_key" not in s:
+            s["output_key"] = None
+        if "domains" not in s:
+            s["domains"] = []
+
+    return subtasks
+
+
+def execute_step(client, model: str, tripletex: TripletexClient,
+                 subtask: dict, context: dict, files: list) -> tuple:
+    """Execute a single subtask in a fresh chat with domain-focused prompt.
+
+    Returns: (api_calls, errors, created_id)
+    """
+    api_calls = []
+    errors = []
+    created_id = None
+
+    task_text = subtask["task"]
+
+    # Replace $variable references with actual values from previous steps
+    for key, value in context.items():
+        task_text = task_text.replace(f"${key}", str(value))
+
+    # Build context string showing available entity IDs
+    today = date.today().isoformat()
+    if context:
+        ctx_lines = [f"  {k} = {v}" for k, v in context.items()]
+        ctx_str = "\n".join(ctx_lines)
+        user_text = f"Today's date is {today}.\n\nSUBTASK:\n{task_text}\n\nCONTEXT (entity IDs from previous steps):\n{ctx_str}"
+    else:
+        user_text = f"Today's date is {today}.\n\nSUBTASK:\n{task_text}"
+
+    # Build user content with files if this is the first step or step needs files
+    user_content = []
+    # Include image/PDF files for vision on steps that might need them
+    for f in files:
+        mime_type = f.get("mime_type", "")
+        if mime_type and mime_type.startswith("image/"):
+            user_content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime_type, "data": f["content_base64"]}
+            })
+        elif mime_type == "application/pdf":
+            user_content.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": f["content_base64"]}
+            })
+
+    # Add file text extraction if there are files
+    file_text = extract_file_content(files)
+    if file_text:
+        user_text += f"\n\n{file_text}"
+
+    user_content.append({"type": "text", "text": user_text})
+
+    # Build focused system prompt from tagged domains
+    domains = subtask.get("domains", [])
+    if domains:
+        domain_docs = build_doer_prompt(domains)
+    else:
+        # Fallback: use keyword classifier on the subtask text
+        fallback_domains = classify_task(task_text, bool(files))
+        domain_docs = build_doer_prompt(fallback_domains)
+
+    system_prompt = STEP_PREFIX + "\n\n" + domain_docs
+
+    # Fresh chat for this step
+    messages = [{"role": "user", "content": user_content}]
+
+    max_iterations = 10
+    for iteration in range(max_iterations):
         response = client.messages.create(
             model=model,
-            max_tokens=2048,
-            system=STRUCTURER_SYSTEM,
-            messages=[{"role": "user", "content": user_content}],
+            max_tokens=4096,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=messages,
         )
-        text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                text += block.text
-        return text.strip()
-    except Exception as e:
-        logger.warning(f"Structurer failed: {e}")
-        return ""  # Fall back to no structured plan
 
+        if response.stop_reason == "end_turn":
+            break
 
-STRUCTURER_SYSTEM = """You are a task analyzer for Tripletex accounting. Your job is to read the task and any attached files, then output a clean structured breakdown.
+        if response.stop_reason != "tool_use":
+            break
 
-OUTPUT FORMAT — respond with ONLY this JSON:
-{
-  "objective": "One sentence: what needs to be done",
-  "extracted_data": {
-    "names": [...],
-    "amounts": [...],
-    "dates": [...],
-    "accounts": [...],
-    "other": {...}
-  },
-  "steps": [
-    "Step 1: description with exact values to use",
-    "Step 2: ...",
-    ...
-  ],
-  "warnings": ["Any tricky aspects to watch out for"]
-}
+        assistant_content = response.content
+        messages.append({"role": "assistant", "content": assistant_content})
 
-RULES:
-- Extract ALL values from the task text and any attached files (receipts, PDFs, CSVs)
-- Pre-compute all calculations (VAT splits, currency conversions, depreciation, etc.)
-- List steps in execution order with exact field values
-- If a file is attached, extract every relevant value (supplier name, date, amounts, items, VAT)
-- Be specific: "Create employee with firstName='Ola', lastName='Nordmann'" not "Create the employee"
-"""
+        tool_results = []
+        for block in assistant_content:
+            if block.type == "tool_use":
+                logger.info(f"    [step {subtask['id']}] {block.name}({json.dumps(block.input, default=str)[:200]})")
+                result = execute_tool(tripletex, block.name, block.input)
+
+                try:
+                    result_parsed = json.loads(result)
+                    status_code = result_parsed.get("status_code", 0)
+                except Exception:
+                    status_code = 0
+                    result_parsed = {}
+
+                call_record = {
+                    "tool": block.name,
+                    "endpoint": block.input.get("endpoint", ""),
+                    "status_code": status_code,
+                }
+                api_calls.append(call_record)
+
+                if status_code >= 400:
+                    err_body = ""
+                    try:
+                        err_body = json.dumps(result_parsed.get("body", {}), ensure_ascii=False)[:500]
+                    except Exception:
+                        pass
+                    errors.append({
+                        "tool": block.name,
+                        "endpoint": block.input.get("endpoint", ""),
+                        "status_code": status_code,
+                        "error_body": err_body,
+                        "input_data": json.dumps(block.input.get("data", {}), default=str, ensure_ascii=False)[:500],
+                    })
+
+                # Extract created entity ID from successful POST/PUT
+                if status_code in (200, 201) and block.name in ("tripletex_post", "tripletex_put"):
+                    try:
+                        body = result_parsed.get("body", {})
+                        value = body.get("value", {})
+                        if isinstance(value, dict) and "id" in value:
+                            created_id = value["id"]
+                    except Exception:
+                        pass
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+
+        messages.append({"role": "user", "content": tool_results})
+
+    return api_calls, errors, created_id
 
 
 def run_agent(prompt: str, files: list, base_url: str, session_token: str) -> dict:
-    """Run the two-phase agent: structurer → executor."""
+    """Run the planner-executor agent to complete an accounting task.
+
+    1. Planner breaks task into subtasks with domains and dependencies
+    2. Each subtask runs in a fresh chat with focused system prompt
+    3. Entity IDs flow between steps via context dict
+    """
     tripletex = TripletexClient(base_url, session_token)
 
     project_id = os.getenv("GCP_PROJECT_ID", "ai-nm26osl-1759")
     region = os.getenv("CLAUDE_VERTEX_REGION", "global")
     model = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 
-    logger.info(f"Using Claude {model} via Vertex AI (project={project_id}, region={region})")
+    logger.info(f"Planner-executor agent using {model} via Vertex AI (project={project_id}, region={region})")
     client = anthropic.AnthropicVertex(project_id=project_id, region=region)
 
-    # Phase 1: Structure the task
-    user_content = build_user_message(prompt, files)
-    structured_plan = structure_task(client, model, user_content)
-    logger.info(f"STRUCTURED_PLAN: {structured_plan[:2000]}")
-
-    # Classify task and build focused system prompt
-    domains = classify_task(prompt, bool(files))
-    system_prompt = build_doer_prompt(domains)
-    logger.info(f"Task domains: {domains} (prompt size: {len(system_prompt)} chars)")
-
-    # Phase 2: Execute with the structured plan injected
-    today = date.today().isoformat()
-    executor_text = f"Today's date is {today}.\n\nORIGINAL TASK:\n{prompt}\n\nSTRUCTURED PLAN (from analysis):\n{structured_plan}\n\nExecute this plan now. Follow the steps exactly. Do NOT skip any step."
-
-    # Build executor message — include files for vision but use structured text
-    executor_content = []
-    for f in files:
-        mime_type = f.get("mime_type", "")
-        if mime_type and mime_type.startswith("image/"):
-            executor_content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": mime_type, "data": f["content_base64"]}
-            })
-        elif mime_type == "application/pdf":
-            executor_content.append({
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": f["content_base64"]}
-            })
-
-    file_text = extract_file_content(files)
-    if file_text:
-        executor_text += f"\n\n{file_text}"
-    executor_content.append({"type": "text", "text": executor_text})
-
-    messages = [{"role": "user", "content": executor_content}]
-
-    max_iterations = 30
-    iteration = 0
-    verified = False
-
-    # Track all API calls for task summary
     api_calls = []
     errors = []
 
     try:
-        while iteration < max_iterations:
-            iteration += 1
-            logger.info(f"Agent iteration {iteration}/{max_iterations}")
+        # Phase 1: Create plan
+        plan = create_plan(client, model, prompt, files)
+        logger.info(f"Plan created: {len(plan)} subtasks")
+        for s in plan:
+            logger.info(f"  Step {s['id']}: {s['task'][:120]}... domains={s.get('domains', [])} depends={s['depends_on']} output_key={s.get('output_key')}")
 
-            response = client.messages.create(
-                model=model,
-                max_tokens=4096,
-                system=system_prompt,
-                tools=TOOLS,
-                messages=messages,
-            )
+        # Phase 2: Execute subtasks in dependency order
+        context = {}  # output_key → entity_id
+        completed = set()
 
-            logger.info(f"  Stop reason: {response.stop_reason}")
+        while len(completed) < len(plan):
+            # Find steps whose dependencies are all completed
+            ready = [
+                s for s in plan
+                if s["id"] not in completed
+                and all(d in completed for d in s["depends_on"])
+            ]
 
-            if response.stop_reason == "end_turn":
-                # Check if we did any writes — if so, run verification
-                write_calls_so_far = [c for c in api_calls if c["tool"] != "tripletex_get"]
-                if write_calls_so_far and not verified:
-                    verified = True
-                    logger.info("Injecting verification step")
-                    messages.append({"role": "assistant", "content": response.content})
-                    messages.append({"role": "user", "content": VERIFY_PROMPT})
-                    continue  # One more iteration for verification
-                logger.info("Agent completed task (end_turn)")
+            if not ready:
+                logger.warning("No ready subtasks but not all complete — circular dependency?")
                 break
 
-            if response.stop_reason != "tool_use":
-                logger.info(f"Agent stopped with reason: {response.stop_reason}")
-                break
+            for subtask in ready:
+                logger.info(f"Executing step {subtask['id']}/{len(plan)}: {subtask['task'][:120]}...")
 
-            # Process tool calls
-            assistant_content = response.content
-            messages.append({"role": "assistant", "content": assistant_content})
+                step_calls, step_errors, created_id = execute_step(
+                    client, model, tripletex, subtask, context, files
+                )
+                api_calls.extend(step_calls)
+                errors.extend(step_errors)
 
-            tool_results = []
-            for block in assistant_content:
-                if block.type == "tool_use":
-                    logger.info(f"  Tool call: {block.name}({json.dumps(block.input, default=str)[:200]})")
-                    result = execute_tool(tripletex, block.name, block.input)
+                # Store created entity ID for downstream steps
+                if subtask.get("output_key") and created_id is not None:
+                    context[subtask["output_key"]] = created_id
+                    logger.info(f"  -> {subtask['output_key']} = {created_id}")
 
-                    # Parse result to track status
-                    try:
-                        result_parsed = json.loads(result)
-                        status_code = result_parsed.get("status_code", 0)
-                    except Exception:
-                        status_code = 0
-
-                    call_record = {
-                        "tool": block.name,
-                        "endpoint": block.input.get("endpoint", ""),
-                        "status_code": status_code,
-                    }
-                    api_calls.append(call_record)
-
-                    if status_code >= 400:
-                        err_body = ""
-                        try:
-                            err_body = json.dumps(result_parsed.get("body", {}), ensure_ascii=False)[:500]
-                        except Exception:
-                            pass
-                        errors.append({
-                            "tool": block.name,
-                            "endpoint": block.input.get("endpoint", ""),
-                            "status_code": status_code,
-                            "error_body": err_body,
-                            "input_data": json.dumps(block.input.get("data", {}), default=str, ensure_ascii=False)[:500],
-                        })
-
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-
-            messages.append({"role": "user", "content": tool_results})
+                completed.add(subtask["id"])
 
     except Exception as e:
-        logger.exception(f"Agent error at iteration {iteration}")
-        errors.append({"tool": "agent", "endpoint": "", "status_code": 0, "error_body": str(e), "input_data": ""})
+        logger.exception("Planner-executor agent error")
+        errors.append({"tool": "agent", "endpoint": "", "status_code": 0,
+                       "error_body": str(e), "input_data": ""})
     finally:
         tripletex.close()
 
-    # Determine success: check if last write calls succeeded (recovered from earlier errors)
+    # Determine success
     write_errors = [e for e in errors if e["tool"] != "tripletex_get"]
     write_calls = [c for c in api_calls if c["tool"] != "tripletex_get"]
-    # Task is FAILED only if it never completed a successful write, or the last write call failed
+
     if write_calls:
         last_write = write_calls[-1]
         has_errors = last_write["status_code"] >= 400
     else:
         has_errors = len(write_errors) > 0
 
-    # Log structured task summary for easy querying
     summary = {
         "task_summary": True,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "prompt": prompt[:2000],
         "status": "FAILED" if has_errors else "OK",
-        "iterations": iteration,
+        "plan_steps": len(plan) if 'plan' in locals() else 0,
         "total_calls": len(api_calls),
-        "write_calls": len([c for c in api_calls if c["tool"] != "tripletex_get"]),
+        "write_calls": len(write_calls),
         "error_count": len(errors),
         "write_error_count": len(write_errors),
         "errors": errors[:20],
