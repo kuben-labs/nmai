@@ -447,6 +447,29 @@ IMPORTANT: Handle partial payments — if CSV amount doesn't exactly match an in
 2. GET /ledger/paymentTypeOut?fields=id,description → get outgoing payment types
 3. POST /supplierInvoice/{id}/:addPayment?paymentTypeId=...&amount=...&paidDate=...
 
+**Register expense from receipt/kvittering (image/PDF attached):**
+1. Read the receipt carefully — extract: supplier name, date, total amount (inkl. MVA), item description
+2. GET /supplier?fields=id,name&count=100 → find the supplier. If not found, POST /supplier to create it
+3. GET /department?fields=id,name&count=100 → find the department specified in the task
+4. GET /ledger/account?count=1000&fields=id,number,name → get accounts. Choose the correct expense account by type:
+   - 7140: Reisekostnad/transport (travel, train tickets, bus, taxi, flights)
+   - 6300: Leie/husleie (rent, storage)
+   - 6540: Inventar/utstyr (equipment, tools)
+   - 6800: Kontorrekvisita (office supplies)
+   - 6900: Telefon/internett (phone, internet)
+   - 7100: Bilkostnader (car expenses, fuel, parking)
+   - 7320: Reklamekostnader (advertising, marketing)
+   - 7350: Representasjon (entertainment, meals with clients)
+   - 7770: Datasystemer/programvare (software, IT)
+   - 7500: Forsikring (insurance)
+5. GET /ledger/vatType?fields=id,name,percentage&count=100 → find VAT type. Common: 25% general, 12% transport, 15% food
+6. Calculate: net amount = total / (1 + vatRate), VAT = total - net
+7. POST /ledger/voucher with postings:
+   - Debit expense account (net amount) with department
+   - Debit input VAT account (VAT amount)
+   - Credit 2400 (accounts payable) with supplier: {"id": supplierId} — REQUIRED on 2400 posting
+CRITICAL: You MUST look up the supplier from the receipt and include supplier: {"id": X} on the accounts payable (2400) posting line.
+
 ## DATE FORMAT
 - Always use ISO format: "YYYY-MM-DD" (e.g., "2026-03-21")
 - When prompt says "today" or doesn't specify: use today's date (provided in the task)

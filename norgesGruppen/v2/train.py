@@ -107,55 +107,36 @@ def main():
             project=str(RUNS_DIR),
             name=f"{args.model}_ngd",
 
-            # ── Augmentation (careful for dense shelf images) ────────
-            # Color: moderate — store lighting varies but product colors matter
-            hsv_h=0.015,        # small hue shift
-            hsv_s=0.3,          # moderate saturation (v1 used 0.7 — too much!)
-            hsv_v=0.3,          # moderate brightness
-
-            # Geometric: small — cameras are roughly fixed but have slight variation
-            degrees=3.0,        # small rotation for slight camera tilt
-            translate=0.1,      # small translation
-            scale=0.5,          # default scale — important for multi-size products
-            shear=2.0,          # tiny shear
-            perspective=0.0001, # tiny perspective
-
-            # Flips
-            fliplr=0.5,         # shelves are symmetric left-right
-            flipud=0.0,         # products are NEVER upside down
-
-            # Mosaic: helps small-object detection but breaks spatial context
+            # ── Augmentation (strong for small dataset) ───────────
+            hsv_h=0.015,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            degrees=5.0,
+            translate=0.1,
+            scale=0.5,
+            shear=2.0,
+            fliplr=0.5,
+            flipud=0.0,
             mosaic=1.0,
-            close_mosaic=50,    # close mosaic 50 epochs before end (v1 used 30)
-
-            # DISABLED — these hurt dense shelf detection:
-            mixup=0.0,          # blending shelves creates ghost products
-            copy_paste=0.0,     # pasting on dense shelves = unrealistic overlaps
+            close_mosaic=15,
+            mixup=0.1,
+            copy_paste=0.1,
 
             # ── Training schedule ────────────────────────────────────
             cos_lr=True,
-            patience=80,        # generous — small dataset has noisy training
+            patience=30,
             warmup_epochs=5,
-            warmup_momentum=0.5,
-
-            # ── Loss weights ─────────────────────────────────────────
-            # Classification is 30% of competition score, boost it
-            cls=1.5,            # default 0.5, v1 used 1.0
-            box=7.5,            # default
-            dfl=1.5,            # default
-
-            # ── Regularization ───────────────────────────────────────
-            dropout=0.1,           # YOLO11 supports head dropout
 
             # ── Other ────────────────────────────────────────────────
-            deterministic=False,  # deterministic=True segfaults with DDP+NCCL
+            deterministic=False,
             save=True,
+            save_period=10,
             plots=True,
             optimizer="AdamW",
             lr0=0.001,
-            lrf=0.01,             # final LR = lr0 * lrf = 1e-5
+            lrf=0.01,
             weight_decay=0.0005,
-            nbs=64,               # nominal batch size for LR scaling
+            amp=True,
         )
 
     # Auto-export best weights to ONNX

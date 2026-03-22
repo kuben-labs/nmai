@@ -9,9 +9,100 @@ from datetime import date, datetime
 import anthropic
 
 from tripletex import TripletexClient
-from prompts import SYSTEM_PROMPT, FILE_HANDLING_PROMPT
+from prompts_v2 import DOMAINS, build_doer_prompt, FILE_HANDLING_PROMPT
 
 logger = logging.getLogger(__name__)
+
+# Keywords → domain mapping for task classification
+DOMAIN_KEYWORDS = {
+    "customer": ["kunde", "customer", "client", "cliente", "kundefaktura"],
+    "supplier": ["leverandør", "supplier", "fournisseur", "proveedor", "fornecedor", "lieferant",
+                 "leverandørkostnad", "leverandørfaktura"],
+    "employee": ["ansatt", "employee", "empleado", "empregado", "mitarbeiter", "employé",
+                 "onboarding", "incorpora", "einarbeitung", "intégration",
+                 "rolle", "role", "admin", "kontoadministrator", "regnskapsfører",
+                 "revisor", "auditor", "faktureringsansvarlig", "personalansvarlig"],
+    "invoice": ["faktura", "invoice", "factura", "fatura", "rechnung", "facture",
+                "ordre", "order", "bestilling", "pedido", "bestellung", "commande",
+                "kreditnota", "credit note", "nota de crédito", "gutschrift",
+                "purring", "reminder", "recordatorio", "rappel", "mahnung"],
+    "voucher": ["bilag", "voucher", "journal", "konto", "account",
+                "debet", "debit", "kredit", "credit",
+                "bokfør", "registrer", "postering",
+                "kvittering", "receipt", "recibo", "quittung", "reçu",
+                "kostnad", "expense", "utgift", "despesa", "gasto", "aufwand", "dépense",
+                "korreksjon", "correction", "feil", "error"],
+    "travel": ["reise", "travel", "viaje", "viagem", "voyage",
+               "diett", "per diem", "dietpenger", "kjøregodtgjørelse", "mileage",
+               "reiseregning"],
+    "project": ["prosjekt", "project", "proyecto", "projeto", "projekt", "projet",
+                "timesheet", "timer", "timar", "hours", "horas", "stunden", "heures"],
+    "salary": ["lønn", "salary", "salario", "gehalt", "salaire",
+               "payroll", "lønnskjøring", "lønnsslipp"],
+    "dimension": ["dimensjon", "dimension", "dimensión", "dimensão"],
+    "department": ["avdeling", "department", "departamento", "abteilung", "département"],
+    "company": ["selskap", "company", "empresa", "unternehmen", "entreprise", "firma"],
+    "contact": ["kontakt", "contact", "contacto"],
+    "bank_reconciliation": ["bankavsteming", "reconciliation", "conciliación", "reconciliação",
+                            "abstimmung", "rapprochement", "kontoutskrift", "bank statement"],
+    "closing": ["avskrivning", "depreciation", "depreciación", "abschreibung", "amortissement",
+                "årsavslutning", "year-end", "periodisering", "accrual",
+                "skattekostnad", "tax provision", "skatt"],
+}
+
+# Domains that should co-include other domains
+DOMAIN_DEPS = {
+    "travel": ["employee"],
+    "salary": ["employee"],
+    "dimension": ["voucher"],
+    "contact": ["customer"],
+    "bank_reconciliation": ["invoice", "supplier"],
+    "closing": ["voucher"],
+}
+
+
+VERIFY_PROMPT = """VERIFICATION CHECK: Before finishing, verify your work:
+1. GET back the key entities you created/modified
+2. Compare each field against the original task requirements
+3. Check: correct amounts? correct dates? correct names? correct accounts? correct department/project links?
+4. If a field is wrong, fix it with PUT (do NOT delete and recreate)
+5. If everything is correct, confirm and stop
+
+IMPORTANT: Do NOT delete any entities during verification. Only use PUT to fix wrong values. Do this now — GET the entities and verify."""
+
+
+def classify_task(prompt: str, has_files: bool) -> list[str]:
+    """Classify task into relevant domains using keyword matching."""
+    prompt_lower = prompt.lower()
+    domains = set()
+
+    for domain, keywords in DOMAIN_KEYWORDS.items():
+        if any(kw in prompt_lower for kw in keywords):
+            domains.add(domain)
+
+    # Receipt/expense from attached image → need supplier + department + voucher
+    if has_files and domains & {"voucher"}:
+        domains.update(["supplier", "department"])
+
+    # Project lifecycle often needs invoice + supplier for costs
+    if "project" in domains and any(w in prompt_lower for w in ["faktura", "invoice", "kostnad", "cost"]):
+        domains.update(["invoice", "customer", "supplier", "voucher"])
+
+    # Invoice tasks need customer
+    if "invoice" in domains:
+        domains.add("customer")
+
+    # Add dependency domains
+    for domain in list(domains):
+        if domain in DOMAIN_DEPS:
+            domains.update(DOMAIN_DEPS[domain])
+
+    # Fallback: if nothing matched, include common domains
+    if not domains:
+        domains = set(DOMAINS.keys())
+
+    return sorted(domains)
+
 
 TOOLS = [
     {
@@ -205,8 +296,56 @@ def execute_tool(client: TripletexClient, tool_name: str, tool_input: dict) -> s
         return json.dumps({"error": str(e)})
 
 
+def structure_task(client, model: str, user_content: list) -> str:
+    """Phase 1: Call the structurer model to extract and organize task info."""
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            system=STRUCTURER_SYSTEM,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                text += block.text
+        return text.strip()
+    except Exception as e:
+        logger.warning(f"Structurer failed: {e}")
+        return ""  # Fall back to no structured plan
+
+
+STRUCTURER_SYSTEM = """You are a task analyzer for Tripletex accounting. Your job is to read the task and any attached files, then output a clean structured breakdown.
+
+OUTPUT FORMAT — respond with ONLY this JSON:
+{
+  "objective": "One sentence: what needs to be done",
+  "extracted_data": {
+    "names": [...],
+    "amounts": [...],
+    "dates": [...],
+    "accounts": [...],
+    "other": {...}
+  },
+  "steps": [
+    "Step 1: description with exact values to use",
+    "Step 2: ...",
+    ...
+  ],
+  "warnings": ["Any tricky aspects to watch out for"]
+}
+
+RULES:
+- Extract ALL values from the task text and any attached files (receipts, PDFs, CSVs)
+- Pre-compute all calculations (VAT splits, currency conversions, depreciation, etc.)
+- List steps in execution order with exact field values
+- If a file is attached, extract every relevant value (supplier name, date, amounts, items, VAT)
+- Be specific: "Create employee with firstName='Ola', lastName='Nordmann'" not "Create the employee"
+"""
+
+
 def run_agent(prompt: str, files: list, base_url: str, session_token: str) -> dict:
-    """Run the agentic loop to complete an accounting task."""
+    """Run the two-phase agent: structurer → executor."""
     tripletex = TripletexClient(base_url, session_token)
 
     project_id = os.getenv("GCP_PROJECT_ID", "ai-nm26osl-1759")
@@ -216,11 +355,45 @@ def run_agent(prompt: str, files: list, base_url: str, session_token: str) -> di
     logger.info(f"Using Claude {model} via Vertex AI (project={project_id}, region={region})")
     client = anthropic.AnthropicVertex(project_id=project_id, region=region)
 
+    # Phase 1: Structure the task
     user_content = build_user_message(prompt, files)
-    messages = [{"role": "user", "content": user_content}]
+    structured_plan = structure_task(client, model, user_content)
+    logger.info(f"STRUCTURED_PLAN: {structured_plan[:2000]}")
+
+    # Classify task and build focused system prompt
+    domains = classify_task(prompt, bool(files))
+    system_prompt = build_doer_prompt(domains)
+    logger.info(f"Task domains: {domains} (prompt size: {len(system_prompt)} chars)")
+
+    # Phase 2: Execute with the structured plan injected
+    today = date.today().isoformat()
+    executor_text = f"Today's date is {today}.\n\nORIGINAL TASK:\n{prompt}\n\nSTRUCTURED PLAN (from analysis):\n{structured_plan}\n\nExecute this plan now. Follow the steps exactly. Do NOT skip any step."
+
+    # Build executor message — include files for vision but use structured text
+    executor_content = []
+    for f in files:
+        mime_type = f.get("mime_type", "")
+        if mime_type and mime_type.startswith("image/"):
+            executor_content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime_type, "data": f["content_base64"]}
+            })
+        elif mime_type == "application/pdf":
+            executor_content.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": f["content_base64"]}
+            })
+
+    file_text = extract_file_content(files)
+    if file_text:
+        executor_text += f"\n\n{file_text}"
+    executor_content.append({"type": "text", "text": executor_text})
+
+    messages = [{"role": "user", "content": executor_content}]
 
     max_iterations = 30
     iteration = 0
+    verified = False
 
     # Track all API calls for task summary
     api_calls = []
@@ -234,7 +407,7 @@ def run_agent(prompt: str, files: list, base_url: str, session_token: str) -> di
             response = client.messages.create(
                 model=model,
                 max_tokens=4096,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 tools=TOOLS,
                 messages=messages,
             )
@@ -242,6 +415,14 @@ def run_agent(prompt: str, files: list, base_url: str, session_token: str) -> di
             logger.info(f"  Stop reason: {response.stop_reason}")
 
             if response.stop_reason == "end_turn":
+                # Check if we did any writes — if so, run verification
+                write_calls_so_far = [c for c in api_calls if c["tool"] != "tripletex_get"]
+                if write_calls_so_far and not verified:
+                    verified = True
+                    logger.info("Injecting verification step")
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({"role": "user", "content": VERIFY_PROMPT})
+                    continue  # One more iteration for verification
                 logger.info("Agent completed task (end_turn)")
                 break
 
@@ -315,7 +496,7 @@ def run_agent(prompt: str, files: list, base_url: str, session_token: str) -> di
     summary = {
         "task_summary": True,
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "prompt": prompt[:500],
+        "prompt": prompt[:2000],
         "status": "FAILED" if has_errors else "OK",
         "iterations": iteration,
         "total_calls": len(api_calls),

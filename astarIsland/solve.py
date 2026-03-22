@@ -625,6 +625,31 @@ def build_features_grid(init_grid_np, settlements, height, width, sig, decay_pro
     return np.array(features, dtype=np.float32), coords
 
 
+def cache_analysis(session, round_id, seed_idx):
+    """Cache ground truth analysis data locally to avoid re-fetching."""
+    cache_name = f"analysis_{round_id}_{seed_idx}"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+    try:
+        analysis = api_get(session, f"/astar-island/analysis/{round_id}/{seed_idx}")
+        cache_set(cache_name, analysis)
+        return analysis
+    except Exception:
+        return None
+
+
+def cache_round_detail(session, round_id):
+    """Cache round detail data locally."""
+    cache_name = f"detail_{round_id}"
+    cached = cache_get(cache_name)
+    if cached is not None:
+        return cached
+    detail = api_get(session, f"/astar-island/rounds/{round_id}")
+    cache_set(cache_name, detail)
+    return detail
+
+
 def build_training_data(session, round_data):
     """Build training features + targets from all studied rounds."""
     cache_file = CACHE_DIR / "ensemble_train.npz"
@@ -649,7 +674,7 @@ def build_training_data(session, round_data):
             continue
 
         round_id = round_info["id"]
-        detail = api_get(session, f"/astar-island/rounds/{round_id}")
+        detail = cache_round_detail(session, round_id)
         initial_states = detail.get("initial_states", [])
         width = detail["map_width"]
         height = detail["map_height"]
@@ -657,9 +682,8 @@ def build_training_data(session, round_data):
         decay = {int(k): v for k, v in rd.get("decay_profile", {}).items()}
 
         for seed_idx in range(min(detail.get("seeds_count", 5), len(initial_states))):
-            try:
-                analysis = api_get(session, f"/astar-island/analysis/{round_id}/{seed_idx}")
-            except Exception:
+            analysis = cache_analysis(session, round_id, seed_idx)
+            if analysis is None:
                 continue
 
             gt = np.array(analysis["ground_truth"])
@@ -733,17 +757,8 @@ def build_prediction(initial_grid_np, settlements, obs_list, height, width,
     dist_map = distance_to_nearest_settlement(height, width, settlements)
     coastal_map = is_coastal_map(initial_grid_np)
 
-    # Precompute decay scaling factors for expansion
-    scale_by_dist = {}
-    if target_decay:
-        blended_decay = get_blended_decay(matched_rounds)
-        for d in range(10):
-            bd = blended_decay.get(d, 0)
-            td = target_decay.get(d, target_decay.get(str(d), bd))
-            if bd > 0.005:
-                scale_by_dist[d] = max(0.1, min(td / bd, 5.0))
-            else:
-                scale_by_dist[d] = 1.0
+    # Precompute blended decay for scaling
+    blended_decay_cache = get_blended_decay(matched_rounds) if target_decay else {}
 
     # Precompute settlement survival scale factor
     surv_scale = 1.0
@@ -799,8 +814,13 @@ def build_prediction(initial_grid_np, settlements, obs_list, height, width,
                         prior /= prior.sum()
 
                 # Rescale expansion probability based on decay profile
-                elif target_decay and d >= 1:
-                    scale = scale_by_dist.get(d, 1.0)
+                if target_decay and d >= 1:
+                    bd = blended_decay_cache.get(d, 0) if blended_decay_cache else 0
+                    td = target_decay.get(d, target_decay.get(str(d), bd))
+                    if bd > 0.005:
+                        scale = np.clip(td / bd, 0.1, 5.0)
+                    else:
+                        scale = 1.0
                     settl_mass = prior[1] + prior[2]
                     if settl_mass > 0.001 and abs(scale - 1.0) > 0.05:
                         prior = prior.copy()
@@ -1133,7 +1153,7 @@ def cmd_backtest(session, round_data=None):
             round_sample_counts[rn] = 0
             continue
         rid = ri["id"]
-        det = api_get(session, f"/astar-island/rounds/{rid}")
+        det = cache_round_detail(session, rid)
         istates = det.get("initial_states", [])
         h, w = det["map_height"], det["map_width"]
         count = 0
@@ -1181,7 +1201,7 @@ def cmd_backtest(session, round_data=None):
         if not round_info:
             continue
         round_id = round_info["id"]
-        detail = api_get(session, f"/astar-island/rounds/{round_id}")
+        detail = cache_round_detail(session, round_id)
         initial_states = detail.get("initial_states", [])
         width = detail["map_width"]
         height = detail["map_height"]
@@ -1191,9 +1211,8 @@ def cmd_backtest(session, round_data=None):
 
         seed_scores = []
         for seed_idx in range(min(detail.get("seeds_count", 5), len(initial_states))):
-            try:
-                analysis = api_get(session, f"/astar-island/analysis/{round_id}/{seed_idx}")
-            except Exception:
+            analysis = cache_analysis(session, round_id, seed_idx)
+            if analysis is None:
                 continue
 
             gt = np.array(analysis["ground_truth"])
