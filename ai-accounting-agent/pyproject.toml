@@ -1,6 +1,6 @@
 [project]
 name = "ai-accounting-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Build an AI agent that completes accounting tasks in Tripletex. You receive a task prompt (in one of 7 languages), use the Tripletex API to execute it, and get scored on correctness and efficiency."
 readme = "README.md"
 authors = [
@@ -14,15 +14,14 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "ai-accountant-mcp",
     "lancedb>=0.30.1",
-    "pydantic-ai[google,anthropic]>=1.70.0",
-    "google-genai>=1.68.0",
-    "anthropic[vertex]>=0.40.0",
+    "machine-core",
     "pdfplumber>=0.11.0",
     "PyPDF2>=3.0.0",
 ]
 
 [tool.uv.sources]
 ai-accountant-mcp = { path = "ai-accountant-mcp" }
+machine-core = { git = "https://github.com/samletnorge/machine-core.git" }
 
 [build-system]
 requires = ["uv_build>=0.8.17,<0.9.0"]

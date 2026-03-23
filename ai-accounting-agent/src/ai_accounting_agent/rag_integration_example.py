@@ -40,7 +40,7 @@ async def run_accounting_task_with_rag(
         try:
             # Try to import embedding provider - optional
             try:
-                from .embeddings import get_embedding_provider
+                from model_providers import get_embedding_provider
 
                 embedding_provider = get_embedding_provider()
                 logger.info("Using embeddings for RAG filtering")

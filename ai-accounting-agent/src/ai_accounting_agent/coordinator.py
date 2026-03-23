@@ -5,6 +5,9 @@ Direct OpenAPI tools architecture (no MCP):
 - Generates pydantic-ai Tools from endpoints
 - Agent calls Tripletex API directly via httpx
 - No separate MCP server process needed
+
+Uses machine-core for model/embedding setup and agent lifecycle.
+Uses model-providers for LLM and embedding provider resolution.
 """
 
 import asyncio
@@ -14,9 +17,8 @@ import traceback
 from typing import Dict, List, Any, Optional, Set
 
 from loguru import logger
-from pydantic_ai import Agent, Tool
+from pydantic_ai import Tool
 from pydantic_ai.messages import (
-    TextPart,
     ToolCallPart,
     ToolReturnPart,
     RetryPromptPart,
@@ -24,11 +26,10 @@ from pydantic_ai.messages import (
 from pydantic_ai._agent_graph import (
     CallToolsNode,
     ModelRequestNode,
-    UserPromptNode,
 )
 
-from .llm import get_google_model
-from .embeddings import get_embedding_provider
+from model_providers import get_embedding_provider, EmbeddingProviderConfig
+
 from .prompts import (
     ACCOUNTING_SYSTEM_INSTRUCTIONS,
     ACCOUNTING_TASK_PROMPT_TEMPLATE,
@@ -43,6 +44,10 @@ _rag_init_lock = asyncio.Lock()
 _openapi_spec_cache: Optional[Dict[str, Any]] = None
 _openapi_spec_lock = asyncio.Lock()
 _tools_cache: Dict[str, List[Tool]] = {}  # keyed by base_url+token hash
+
+# Shared AgentCore instance (initialized once, rebuilt per request with new tools)
+_agent_core = None
+_agent_core_lock = asyncio.Lock()
 
 
 # Essential tools that must ALWAYS be available regardless of RAG filtering.
@@ -144,6 +149,46 @@ ESSENTIAL_TOOLS = {
 }
 
 
+async def _get_agent_core():
+    """Get or create the shared AgentCore instance.
+
+    The AgentCore is created once (initializes model + embedding providers),
+    then rebuilt per-request with different tools via rebuild_agent().
+    """
+    global _agent_core
+
+    if _agent_core is not None:
+        return _agent_core
+
+    async with _agent_core_lock:
+        if _agent_core is not None:
+            return _agent_core
+
+        from machine_core import AgentCore, AgentConfig
+
+        logger.info("Initializing shared AgentCore (model + embedding providers)...")
+
+        # Configure for high retry count (accounting tasks are complex)
+        config = AgentConfig(
+            max_tool_retries=30,
+            timeout=300.0,
+        )
+
+        # Create AgentCore with dynamic tools mode (no MCP).
+        # We pass an empty tools list here; it will be rebuilt per-request.
+        _agent_core = AgentCore(
+            tools=[],
+            system_prompt=ACCOUNTING_SYSTEM_INSTRUCTIONS,
+            agent_config=config,
+        )
+
+        logger.info(
+            f"AgentCore initialized: provider_type={_agent_core.provider_type}, "
+            f"embedding={'available' if _agent_core.embedding else 'unavailable'}"
+        )
+        return _agent_core
+
+
 async def _get_openapi_spec(base_url: str, session_token: str) -> Dict[str, Any]:
     """Get OpenAPI spec, using cache if available.
 
@@ -179,6 +224,10 @@ async def _get_openapi_spec(base_url: str, session_token: str) -> Dict[str, Any]
 async def _get_rag_manager():
     """Get or create the shared RAG manager (cached across requests).
 
+    Uses the embedding provider from model-providers (via machine-core
+    or directly). The ToolEmbedder accepts ResolvedEmbedding objects
+    and extracts the .provider attribute automatically.
+
     Thread-safe: uses _rag_init_lock to prevent duplicate initialization.
     """
     global _rag_manager, _rag_initialized
@@ -194,9 +243,14 @@ async def _get_rag_manager():
 
         logger.info("Initializing shared RAG tool manager...")
 
+        # Use model-providers for embedding resolution.
+        # get_embedding_provider() returns ResolvedEmbedding(provider, model_name, dims).
+        # The ToolEmbedder in rag_tool_filter.py handles ResolvedEmbedding via
+        # hasattr(embedding_provider, "provider") check.
         try:
-            embedding_provider = get_embedding_provider()
-            logger.debug("Using Google embedding provider")
+            resolved_embedding = get_embedding_provider()
+            embedding_provider = resolved_embedding
+            logger.debug(f"Using embedding provider: {resolved_embedding.model_name}")
         except Exception as e:
             logger.warning(f"Could not load embedding provider: {e}")
             embedding_provider = None
@@ -256,10 +310,14 @@ async def run_accounting_task(
 ) -> Dict[str, Any]:
     """Run the accounting task with direct OpenAPI tools (no MCP).
 
+    Uses machine-core's AgentCore for model setup and agent lifecycle.
+    Per-request: rebuilds agent with RAG-filtered tools via rebuild_agent().
+
     1. Fetch OpenAPI spec (cached)
     2. RAG filter to select relevant tools
     3. Generate pydantic-ai Tools from spec
-    4. Run agent with those tools
+    4. Rebuild agent with those tools
+    5. Run agent with step-by-step logging
 
     Args:
         prompt: The accounting task prompt
@@ -290,13 +348,16 @@ Use the information from the attached files above to complete the task."""
         logger.info(f"Added {len(file_content)} chars of file content to prompt")
 
     try:
-        # 1. Get OpenAPI spec (cached)
+        # 1. Get shared AgentCore (model + embedding initialized once)
+        agent_core = await _get_agent_core()
+
+        # 2. Get OpenAPI spec (cached)
         spec = await _get_openapi_spec(base_url, session_token)
 
-        # 2. Get relevant tool names via RAG
+        # 3. Get relevant tool names via RAG
         relevant_names = await _get_relevant_tool_names(full_prompt, spec)
 
-        # 3. Generate tools from spec (filtered to relevant ones)
+        # 4. Generate tools from spec (filtered to relevant ones)
         tools = generate_tools_from_openapi(
             spec=spec,
             base_url=base_url,
@@ -310,24 +371,19 @@ Use the information from the attached files above to complete the task."""
 
         logger.info(f"Generated {len(tools)} direct API tools (no MCP)")
 
-        # 4. Build execution prompt
+        # 5. Build execution prompt
         execution_prompt = ACCOUNTING_TASK_PROMPT_TEMPLATE.format(
             task_description=full_prompt,
         )
 
-        # 5. Create and run agent
-        model = get_google_model()
-        agent = Agent(
-            model=model,
-            tools=tools,
-            system_prompt=ACCOUNTING_SYSTEM_INSTRUCTIONS,
-            retries=30,
-        )
+        # 6. Rebuild agent with per-request tools (reuses model from AgentCore)
+        agent_core.rebuild_agent(tools=tools, retries=30)
 
+        # 7. Execute with step-by-step logging via agent.iter()
         logger.info("Executing task with direct API tools...")
         step_num = 0
         try:
-            async with agent.iter(execution_prompt) as agent_run:
+            async with agent_core.agent.iter(execution_prompt) as agent_run:
                 async for node in agent_run:
                     step_num += 1
                     node_type = type(node).__name__
