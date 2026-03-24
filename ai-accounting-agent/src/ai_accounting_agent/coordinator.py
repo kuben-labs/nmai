@@ -6,11 +6,13 @@ Direct OpenAPI tools architecture (no MCP):
 - Agent calls Tripletex API directly via httpx
 - No separate MCP server process needed
 
-Uses machine-core for model/embedding setup and agent lifecycle.
+Uses machine-core for model/embedding setup, agent lifecycle,
+OpenAPI tools generation, RAG tool filtering, and file processing.
 Uses model-providers for LLM and embedding provider resolution.
 """
 
 import asyncio
+import base64
 import json
 import os
 import traceback
@@ -30,20 +32,27 @@ from pydantic_ai._agent_graph import (
 
 from model_providers import get_embedding_provider, EmbeddingProviderConfig
 
+from machine_core import (
+    AgentCore,
+    AgentConfig,
+    generate_tools_from_openapi,
+    fetch_openapi_spec,
+    Embedder,
+    VectorStore,
+    ToolFilterManager,
+)
+
 from .prompts import (
     ACCOUNTING_SYSTEM_INSTRUCTIONS,
     ACCOUNTING_TASK_PROMPT_TEMPLATE,
 )
-from .rag_tool_manager import create_rag_tool_manager
-from .openapi_tools import generate_tools_from_openapi, fetch_openapi_spec
 
 # Module-level caches (protected by narrow init locks for concurrent requests)
-_rag_manager = None
-_rag_initialized = False
-_rag_init_lock = asyncio.Lock()
+_tool_filter_manager = None
+_tool_filter_initialized = False
+_tool_filter_lock = asyncio.Lock()
 _openapi_spec_cache: Optional[Dict[str, Any]] = None
 _openapi_spec_lock = asyncio.Lock()
-_tools_cache: Dict[str, List[Tool]] = {}  # keyed by base_url+token hash
 
 # Shared AgentCore instance (initialized once, rebuilt per request with new tools)
 _agent_core = None
@@ -149,6 +158,17 @@ ESSENTIAL_TOOLS = {
 }
 
 
+def _make_auth_headers(session_token: str) -> Dict[str, str]:
+    """Create Tripletex Basic Auth headers: base64("0:" + session_token).
+
+    This is the only Tripletex-specific auth logic. machine-core's
+    generate_tools_from_openapi() accepts generic auth_headers.
+    """
+    credentials = f"0:{session_token}"
+    encoded = base64.b64encode(credentials.encode()).decode()
+    return {"Authorization": f"Basic {encoded}"}
+
+
 async def _get_agent_core():
     """Get or create the shared AgentCore instance.
 
@@ -163,8 +183,6 @@ async def _get_agent_core():
     async with _agent_core_lock:
         if _agent_core is not None:
             return _agent_core
-
-        from machine_core import AgentCore, AgentConfig
 
         logger.info("Initializing shared AgentCore (model + embedding providers)...")
 
@@ -210,9 +228,10 @@ async def _get_openapi_spec(base_url: str, session_token: str) -> Dict[str, Any]
         # Fetch from sandbox (always available, spec is universal)
         sandbox_url = os.getenv("API_URL", "https://kkpqfuj-amager.tripletex.dev/v2")
         sandbox_token = os.getenv("SESSION_TOKEN", "")
+        auth_headers = _make_auth_headers(sandbox_token) if sandbox_token else None
 
         try:
-            spec = await fetch_openapi_spec(sandbox_url, sandbox_token)
+            spec = await fetch_openapi_spec(sandbox_url, auth_headers=auth_headers)
             _openapi_spec_cache = spec
             logger.info(f"Fetched OpenAPI spec: {len(spec.get('paths', {}))} paths")
             return spec
@@ -221,49 +240,51 @@ async def _get_openapi_spec(base_url: str, session_token: str) -> Dict[str, Any]
             raise
 
 
-async def _get_rag_manager():
-    """Get or create the shared RAG manager (cached across requests).
+async def _get_tool_filter_manager():
+    """Get or create the shared ToolFilterManager (cached across requests).
 
-    Uses the embedding provider from model-providers (via machine-core
-    or directly). The ToolEmbedder accepts ResolvedEmbedding objects
-    and extracts the .provider attribute automatically.
-
-    Thread-safe: uses _rag_init_lock to prevent duplicate initialization.
+    Uses machine-core's Embedder + VectorStore + ToolFilterManager.
+    Thread-safe: uses _tool_filter_lock to prevent duplicate initialization.
     """
-    global _rag_manager, _rag_initialized
+    global _tool_filter_manager, _tool_filter_initialized
 
     # Fast path: no lock needed if already initialized
-    if _rag_manager is not None and _rag_initialized:
-        return _rag_manager
+    if _tool_filter_manager is not None and _tool_filter_initialized:
+        return _tool_filter_manager
 
-    async with _rag_init_lock:
+    async with _tool_filter_lock:
         # Double-check after acquiring lock
-        if _rag_manager is not None and _rag_initialized:
-            return _rag_manager
+        if _tool_filter_manager is not None and _tool_filter_initialized:
+            return _tool_filter_manager
 
-        logger.info("Initializing shared RAG tool manager...")
+        logger.info("Initializing shared ToolFilterManager...")
 
         # Use model-providers for embedding resolution.
-        # get_embedding_provider() returns ResolvedEmbedding(provider, model_name, dims).
-        # The ToolEmbedder in rag_tool_filter.py handles ResolvedEmbedding via
-        # hasattr(embedding_provider, "provider") check.
         try:
             resolved_embedding = get_embedding_provider()
-            embedding_provider = resolved_embedding
+            embedder = Embedder(resolved_embedding)
             logger.debug(f"Using embedding provider: {resolved_embedding.model_name}")
         except Exception as e:
             logger.warning(f"Could not load embedding provider: {e}")
-            embedding_provider = None
+            embedder = Embedder(None)
 
-        top_k = int(os.getenv("TOP_K", "200"))
-        _rag_manager = create_rag_tool_manager(
-            embedding_provider=embedding_provider,
-            top_k=top_k,
+        vector_store = VectorStore(
+            db_path=os.getenv("VECTOR_STORE_PATH", ".vector_store"),
+            embedder=embedder,
         )
-        await _rag_manager.initialize()
-        _rag_initialized = True
 
-        return _rag_manager
+        _tool_filter_manager = ToolFilterManager(
+            embedder=embedder,
+            vector_store=vector_store,
+        )
+        _tool_filter_initialized = True
+
+        logger.info(
+            f"ToolFilterManager initialized "
+            f"(indexed: {_tool_filter_manager.is_indexed}, "
+            f"tools: {_tool_filter_manager.tool_count})"
+        )
+        return _tool_filter_manager
 
 
 async def _get_relevant_tool_names(task_prompt: str, spec: Dict[str, Any]) -> Set[str]:
@@ -272,35 +293,23 @@ async def _get_relevant_tool_names(task_prompt: str, spec: Dict[str, Any]) -> Se
     If the RAG index is empty (first run or cleared), rebuilds it
     from the OpenAPI spec.
     """
-    rag_manager = await _get_rag_manager()
+    manager = await _get_tool_filter_manager()
 
-    # If no tools indexed, rebuild from OpenAPI spec
-    stats = rag_manager.get_statistics()
-    if stats.get("total_tools", 0) == 0:
-        logger.info("RAG index empty, rebuilding from OpenAPI spec...")
-        from .rag_tool_filter import index_openapi_tools
-
-        if rag_manager.vector_store and rag_manager.embedder:
-            await index_openapi_tools(
-                spec=spec,
-                vector_store=rag_manager.vector_store,
-                embedder=rag_manager.embedder,
-            )
-        else:
-            logger.warning(
-                "No vector store or embedder, returning essential tools only"
-            )
-            return ESSENTIAL_TOOLS
+    # If no tools indexed, index from OpenAPI spec
+    if not manager.is_indexed:
+        logger.info("Tool filter index empty, indexing from OpenAPI spec...")
+        await manager.index_openapi(spec)
 
     top_k = int(os.getenv("TOP_K", "200"))
-    relevant_names = await rag_manager.get_relevant_names(task_prompt, top_k=top_k)
-    relevant_names = relevant_names | ESSENTIAL_TOOLS
+    result = await manager.filter(
+        task_prompt, top_k=top_k, essential_tools=ESSENTIAL_TOOLS
+    )
 
     logger.info(
-        f"Tool filter: {len(relevant_names)} tools selected "
-        f"(RAG: 200 + essential: {len(ESSENTIAL_TOOLS)} with overlap)"
+        f"Tool filter: {len(result.names)} tools selected "
+        f"(sources: {{{', '.join(f'{k}: {len(v)}' for k, v in result.by_source.items())}}})"
     )
-    return relevant_names
+    return result.names
 
 
 async def run_accounting_task(
@@ -358,10 +367,12 @@ Use the information from the attached files above to complete the task."""
         relevant_names = await _get_relevant_tool_names(full_prompt, spec)
 
         # 4. Generate tools from spec (filtered to relevant ones)
+        # Construct Tripletex auth headers (this is the only Tripletex-specific part)
+        auth_headers = _make_auth_headers(session_token)
         tools = generate_tools_from_openapi(
             spec=spec,
             base_url=base_url,
-            session_token=session_token,
+            auth_headers=auth_headers,
             tool_filter=relevant_names,
         )
 

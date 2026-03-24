@@ -12,7 +12,7 @@ from loguru import logger
 from dotenv import load_dotenv
 
 from .coordinator import run_accounting_task
-from .file_processor import FileProcessor
+from machine_core import FileProcessor
 
 # Load environment variables
 load_dotenv()
