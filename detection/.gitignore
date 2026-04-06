@@ -1,9 +1,27 @@
+# Downloaded/generated data
 data/
+configs/dataset.yaml
+
+# Training outputs
 runs/
 output/
-submission/
+
+# Model weights
 *.pt
+*.onnx
+
+# Submissions (downloaded from HF)
+submissions/
 submission.zip
+
+# Python
 __pycache__/
 .ruff_cache/
-submission*
+
+# HF staging dirs (remove after initial push)
+hf_dataset/
+hf_models/
+
+# Archives
+data.zip
+submissions.zip
