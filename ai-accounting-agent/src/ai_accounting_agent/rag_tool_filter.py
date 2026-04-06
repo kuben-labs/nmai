@@ -133,6 +133,8 @@ Parameters: {params_str}
 class ToolVectorStore:
     """Manages tool embeddings and vector similarity search using LanceDB."""
 
+    HF_DATASET_REPO = "valiantlynxz/tripletex-tool-embeddings"
+
     def __init__(self, db_path: str = ".tool_embeddings"):
         """Initialize the vector store using LanceDB.
 
@@ -154,10 +156,19 @@ class ToolVectorStore:
         # Load existing tools from database
         self._load_from_disk()
 
+        # If local LanceDB is empty, try loading from HuggingFace
+        if len(self.tools) == 0:
+            self._load_from_huggingface()
+
     def _load_from_disk(self):
         """Load tools from LanceDB if the table exists."""
         try:
-            if "tools" in self.db.table_names():
+            table_names = (
+                self.db.list_tables()
+                if hasattr(self.db, "list_tables")
+                else self.db.table_names()
+            )
+            if "tools" in table_names:
                 self.table = self.db.open_table("tools")
                 records = self.table.search().limit(10000).to_list()
 
@@ -177,6 +188,60 @@ class ToolVectorStore:
 
         except Exception as e:
             logger.warning(f"Failed to load tools from LanceDB: {e}")
+
+    def _load_from_huggingface(self):
+        """Load pre-computed embeddings from HuggingFace dataset.
+
+        Falls back silently if the datasets library is not installed
+        or the download fails (e.g. no internet).
+        """
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            logger.debug(
+                "datasets library not installed, skipping HuggingFace fallback"
+            )
+            return
+
+        try:
+            logger.info(
+                f"LanceDB empty, downloading embeddings from {self.HF_DATASET_REPO}..."
+            )
+            ds = load_dataset(self.HF_DATASET_REPO, name="embeddings", split="train")
+
+            for row in ds:
+                embedding = row.get("embedding")
+                if embedding is not None:
+                    embedding = list(embedding)
+
+                params = row.get("parameters", "{}")
+                # Parse parameters if stored as JSON string
+                if isinstance(params, str):
+                    try:
+                        params = json.loads(params)
+                    except (json.JSONDecodeError, TypeError):
+                        params = {}
+
+                tool = ToolMetadata(
+                    name=row["name"],
+                    description=row.get("description", ""),
+                    parameters=params,
+                    embedding=embedding,
+                )
+                self.tools[row["name"]] = tool
+
+            if self.tools:
+                # Persist to LanceDB so next startup is instant
+                self._save_to_disk()
+                logger.info(
+                    f"Loaded {len(self.tools)} tools from HuggingFace "
+                    f"and saved to LanceDB"
+                )
+            else:
+                logger.warning("HuggingFace dataset returned no tools")
+
+        except Exception as e:
+            logger.warning(f"Failed to load from HuggingFace: {e}")
 
     def _save_to_disk(self):
         """Save tools to LanceDB with embeddings."""

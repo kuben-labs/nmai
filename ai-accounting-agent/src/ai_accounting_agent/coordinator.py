@@ -220,10 +220,14 @@ async def _get_relevant_tool_names(task_prompt: str, spec: Dict[str, Any]) -> Se
     """
     rag_manager = await _get_rag_manager()
 
-    # If no tools indexed, rebuild from OpenAPI spec
+    # If no tools indexed (LanceDB empty AND HuggingFace fallback failed),
+    # rebuild from OpenAPI spec as last resort (requires embedding API key)
     stats = rag_manager.get_statistics()
     if stats.get("total_tools", 0) == 0:
-        logger.info("RAG index empty, rebuilding from OpenAPI spec...")
+        logger.info(
+            "RAG index empty after LanceDB + HuggingFace fallback, "
+            "re-embedding from OpenAPI spec (requires GCP_API_KEY)..."
+        )
         from .rag_tool_filter import index_openapi_tools
 
         if rag_manager.vector_store and rag_manager.embedder:
